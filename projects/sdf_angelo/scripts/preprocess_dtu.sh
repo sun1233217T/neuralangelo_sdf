@@ -8,30 +8,14 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 # -----------------------------------------------------------------------------
 
-_parent_: projects/neuralangelo/configs/base.yaml
+# usage: dtu_download.sh <path_to_dtu>
 
-model:
-    object:
-        sdf:
-            mlp:
-                inside_out: False
-            encoding:
-                coarse2fine:
-                    init_active_level: 4
-        s_var:
-            init_val: 1.4
-    appear_embed:
-        enabled: False
-
-data:
-    type: projects.neuralangelo.data
-    root: /home/haochen/data/DTU/scan24
-    train:
-        image_size: [1200,1600]
-        batch_size: 1
-        subset:
-    val:
-        image_size: [300,400]
-        batch_size: 1
-        subset: 1
-        max_viz_samples: 16
+echo "Download DTU data"
+mkdir -p "${1}"
+curl -L -o data.zip https://www.dropbox.com/sh/w0y8bbdmxzik3uk/AAAaZffBiJevxQzRskoOYcyja?dl=1
+unzip data.zip "data_DTU.zip"
+rm data.zip
+unzip -q data_DTU.zip -d ${1}
+rm data_DTU.zip
+echo "Generate json files"
+python3 projects/neuralangelo/scripts/convert_dtu_to_json.py --dtu_path ${1}

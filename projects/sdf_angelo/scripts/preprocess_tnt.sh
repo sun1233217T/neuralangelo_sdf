@@ -8,30 +8,13 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 # -----------------------------------------------------------------------------
 
-_parent_: projects/neuralangelo/configs/base.yaml
+# usage: tnt_download.sh <path_to_tnt>
 
-model:
-    object:
-        sdf:
-            mlp:
-                inside_out: False
-            encoding:
-                coarse2fine:
-                    init_active_level: 4
-        s_var:
-            init_val: 1.4
-    appear_embed:
-        enabled: False
+echo "Download fixed poses for Courthouse"
+gdown 10pcCwaQY6hqyiegJGdgmLp_HMFOnsmgq
+gdown 19TT5aTz3z60eUVIDhFJ7EgGqpcqQnJEi
+mv Courthouse_COLMAP_SfM.log ${1}/Courthouse/Courthouse_COLMAP_SfM.log
+mv Courthouse_trans.txt ${1}/Courthouse/Courthouse_trans.txt
 
-data:
-    type: projects.neuralangelo.data
-    root: /home/haochen/data/DTU/scan24
-    train:
-        image_size: [1200,1600]
-        batch_size: 1
-        subset:
-    val:
-        image_size: [300,400]
-        batch_size: 1
-        subset: 1
-        max_viz_samples: 16
+echo "Compute intrinsics, undistort images and generate json files. This may take a while"
+python3 projects/neuralangelo/scripts/convert_tnt_to_json.py --tnt_path ${1}

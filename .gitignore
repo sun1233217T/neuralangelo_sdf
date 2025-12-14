@@ -29,6 +29,9 @@ checkpoints
 *.pt
 *.bin
 *.ply
+*.out
+*.log
+*.txt
 
 # log folder
 logs/

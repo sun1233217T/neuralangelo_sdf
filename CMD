@@ -1,0 +1,27 @@
+EXPERIMENT=dtu
+GROUP=test
+NAME=runtime_test
+CONFIG=projects/sdf_angelo/configs/${EXPERIMENT}.yaml
+GPUS=1  # use >1 for multi-GPU training!
+CUDA_VISIBLE_DEVICES=3 torchrun --master_port=29503 --nproc_per_node=${GPUS} train.py \
+    --logdir=logs/${GROUP}/${NAME} \
+    --config=${CONFIG} \
+    --show_pbar \
+	--wandb  --wandb_name runtime_test\
+	--resume
+
+python3 projects/neuralangelo/scripts/convert_data_to_json.py --data_dir /home/haochen/data/DTU/scan24 --scene_type object
+
+
+CHECKPOINT=logs/${GROUP}/${NAME}/xxx.pt
+OUTPUT_MESH=logs/${GROUP}/${NAME}/test.ply
+CONFIG=logs/${GROUP}/${NAME}/config.yaml
+RESOLUTION=2048
+BLOCK_RES=128
+GPUS=1  # use >1 for multi-GPU mesh extraction
+torchrun --nproc_per_node=${GPUS} projects/neuralangelo/scripts/extract_mesh.py \
+    --config=${CONFIG} \
+    --checkpoint=${CHECKPOINT} \
+    --output_file=${OUTPUT_MESH} \
+    --resolution=${RESOLUTION} \
+    --block_res=${BLOCK_RES}

@@ -8,30 +8,10 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 # -----------------------------------------------------------------------------
 
-_parent_: projects/neuralangelo/configs/base.yaml
+# usage: preprocess.sh <sequence_name> <full_video_path> <downsample_rate> <scene_type>
 
-model:
-    object:
-        sdf:
-            mlp:
-                inside_out: False
-            encoding:
-                coarse2fine:
-                    init_active_level: 4
-        s_var:
-            init_val: 1.4
-    appear_embed:
-        enabled: False
-
-data:
-    type: projects.neuralangelo.data
-    root: /home/haochen/data/DTU/scan24
-    train:
-        image_size: [1200,1600]
-        batch_size: 1
-        subset:
-    val:
-        image_size: [300,400]
-        batch_size: 1
-        subset: 1
-        max_viz_samples: 16
+data_path=datasets/${1}_ds${3}
+bash projects/neuralangelo/scripts/run_ffmpeg.sh ${1} ${2} ${3}
+bash projects/neuralangelo/scripts/run_colmap.sh ${data_path}
+python3 projects/neuralangelo/scripts/convert_data_to_json.py --data_dir ${data_path} --scene_type ${4}
+python3 projects/neuralangelo/scripts/generate_config.py --sequence_name ${1} --data_dir ${data_path} --scene_type ${4}

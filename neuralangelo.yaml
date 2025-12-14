@@ -2,15 +2,14 @@
 name: neuralangelo
 channels:
   - conda-forge
-  - pytorch
 dependencies:
   # general
   - gpustat
   - gdown
-  - cudatoolkit-dev
+  - cuda
   - cmake
   # python general
-  - python=3.8
+  - python=3.10
   - pip
   - numpy
   - scipy
@@ -19,8 +18,5 @@ dependencies:
   - cython
   - ninja
   - diskcache
-  # pytorch
-  - pytorch
-  - torchvision
   - pip:
     - -r requirements.txt

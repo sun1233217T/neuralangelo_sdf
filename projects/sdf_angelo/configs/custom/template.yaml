@@ -8,6 +8,9 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 # -----------------------------------------------------------------------------
 
+# NOTE: this template is an example for designing your custom config file. It is not intended to be used directly.
+# Please preprocess your custom data and auto-generate the config file before customizing.
+
 _parent_: projects/neuralangelo/configs/base.yaml
 
 model:
@@ -17,15 +20,15 @@ model:
                 inside_out: False
             encoding:
                 coarse2fine:
-                    init_active_level: 4
-        s_var:
-            init_val: 1.4
+                    init_active_level: 8
     appear_embed:
-        enabled: False
+        enabled: True
+        dim: 8
 
 data:
     type: projects.neuralangelo.data
-    root: /home/haochen/data/DTU/scan24
+    root:  # The root path of the dataset.
+    num_images:  # The number of training images.
     train:
         image_size: [1200,1600]
         batch_size: 1
@@ -34,4 +37,7 @@ data:
         image_size: [300,400]
         batch_size: 1
         subset: 1
-        max_viz_samples: 16
+        max_viz_samples:
+    readjust:
+        center: [0.,0.,0.]
+        scale: 1.

@@ -8,30 +8,30 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 # -----------------------------------------------------------------------------
 
-_parent_: projects/neuralangelo/configs/base.yaml
+_parent_: projects/sdf_angelo/configs/base.yaml
 
 model:
     object:
         sdf:
             mlp:
-                inside_out: False
+                inside_out: False   # True for Meetingroom.
             encoding:
                 coarse2fine:
-                    init_active_level: 4
-        s_var:
-            init_val: 1.4
+                    init_active_level: 8
     appear_embed:
-        enabled: False
+        enabled: True
+        dim: 8
 
 data:
-    type: projects.neuralangelo.data
-    root: /home/haochen/data/DTU/scan24
+    type: projects.sdf_angelo.data
+    root: datasets/tanks_and_temples/Barn
+    num_images: 410  # The number of training images.
     train:
-        image_size: [1200,1600]
+        image_size: [835,1500]
         batch_size: 1
         subset:
     val:
-        image_size: [300,400]
+        image_size: [300,540]
         batch_size: 1
         subset: 1
         max_viz_samples: 16
