@@ -19,6 +19,8 @@ from imaginaire.utils.visualization import wandb_image
 from projects.nerf.trainers.base import BaseTrainer
 from projects.sdf_angelo.utils.misc import get_scheduler, eikonal_loss, curvature_loss
 
+from mtools import debug
+
 
 class Trainer(BaseTrainer):
 
@@ -50,6 +52,8 @@ class Trainer(BaseTrainer):
             # Compute loss on the entire image.
             self.losses["render"] = self.criteria["render"](data["rgb_map"], data["image"])
             self.metrics["psnr"] = -10 * torch_F.mse_loss(data["rgb_map"], data["image"]).log10()
+        # for key in self.losses:
+        #     print(f"{mode} loss {key}: {self.losses[key].item()} weight: {self.weights.get(key, 'N/A')}")
 
     def get_curvature_weight(self, current_iteration, init_weight):
         if "curvature" in self.weights:

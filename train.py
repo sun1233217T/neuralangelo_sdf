@@ -84,7 +84,7 @@ def main():
     # Initialize Wandb.
     trainer.init_wandb(cfg,
                        project=args.wandb_name,
-                       mode="disabled" if args.debug or not args.wandb else "online",
+                       mode="disabled" if args.debug or not args.wandb else "offline",
                        resume=args.resume,
                        use_group=True)
 

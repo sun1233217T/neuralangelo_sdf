@@ -67,7 +67,7 @@ class Model(BaseModel):
 
     def forward(self, data):
         # Randomly sample and render the pixels.
-        output = self.render_pixels(data["pose"], data["intr"], image_size=self.image_size_train,
+        output = self.render_pixels_surface(data["pose"], data["intr"], image_size=self.image_size_train,
                                     stratified=self.cfg_render.stratified, sample_idx=data["idx"],
                                     ray_idx=data["ray_idx"])
         return output
@@ -76,8 +76,16 @@ class Model(BaseModel):
     def inference(self, data):
         self.eval()
         # Render the full images.
-        output = self.render_image(data["pose"], data["intr"], image_size=self.image_size_val,
+        import time
+        # time0 = time.time()
+        # output1 = self.render_image(data["pose"], data["intr"], image_size=self.image_size_val,
+        #                            stratified=False, sample_idx=data["idx"])  # [B,N,C]
+        time1 = time.time()
+        output = self.rander_image_surface(data["pose"], data["intr"], image_size=self.image_size_val,
                                    stratified=False, sample_idx=data["idx"])  # [B,N,C]
+        time2 = time.time()
+        print(f"Render surface time: {time2 - time1:.4f}s")
+        # debug()
         # Get full rendered RGB and depth images.
         rot = data["pose"][..., :3, :3]  # [B,3,3]
         normal_cam = -output["gradient"] @ rot.transpose(-1, -2)  # [B,HW,3]
@@ -156,13 +164,101 @@ class Model(BaseModel):
             hessians=output_object["hessians"],  # [B,R,No,3]/None
         )
         return output
+    
+    def render_pixels_surface(self, pose, intr, image_size, stratified=False, sample_idx=None, ray_idx=None):
+        center, ray = camera.get_center_and_ray(pose, intr, image_size)  # [B,HW,3]
+        center = nerf_util.slice_by_ray_idx(center, ray_idx)  # [B,R,3]
+        ray = nerf_util.slice_by_ray_idx(ray, ray_idx)  # [B,R,3]
+        ray_unit = torch_F.normalize(ray, dim=-1)  # [B,R,3]
+        output = self.render_ray_surface(center, ray_unit, sample_idx=sample_idx, stratified=stratified)
+        return output
+    
+    def rander_image_surface(self, pose, intr, image_size, stratified=False, sample_idx=None):
+        """ Render the rays given the camera intrinsics and poses.
+        Args:
+            pose (tensor [batch,3,4]): Camera poses ([R,t]).
+            intr (tensor [batch,3,3]): Camera intrinsics.
+            stratified (bool): Whether to stratify the depth sampling.
+            sample_idx (tensor [batch]): Data sample index.
+        Returns:
+            output: A dictionary containing the outputs.
+        """
+
+        output = defaultdict(list)
+        for center, ray, _ in self.ray_generator(pose, intr, image_size, full_image=True):
+            ray_unit = torch_F.normalize(ray, dim=-1)  # [B,R,3]
+            output_batch = self.render_ray_surface(center, ray_unit, sample_idx=sample_idx, stratified=stratified)
+            for key, value in output_batch.items():
+                if value is not None:
+                    output[key].append(value.detach())
+        # Concat each item (list) in output into one tensor. Concatenate along the ray dimension (1)
+        for key, value in output.items():
+            output[key] = torch.cat(value, dim=1)
+        return output
+    
+    def render_ray_surface(self, center, ray_unit, sample_idx=None, stratified=False):
+        app, app_outside = self.get_appearance_embedding(sample_idx, ray_unit.shape[1])
+        with torch.no_grad():
+            near, far, outside = self.get_dist_bounds(center, ray_unit)
+            surf_pts, hit_mask, t_vals = self.det_surface(center, ray_unit, near, far)
+        # Only evaluate valid hits to avoid NaNs and unnecessary compute.
+        outside_bool = outside.squeeze(-1) if outside.dim() > 2 else outside  # [B,R]
+        valid = hit_mask & (~outside_bool)  # [B,R]
+        # Pre-allocate outputs.
+        rgbs = torch.zeros(*center.shape[:2], 3, device=center.device, dtype=center.dtype)
+        gradients = torch.zeros_like(rgbs)
+        hessians = torch.zeros_like(rgbs) if self.training else None
+        if valid.any():
+            pts_valid = surf_pts[valid]  # [Nh,3]
+            rays_valid = ray_unit[valid]  # [Nh,3]
+            if app is not None:
+                app_valid = app[..., 0, :][valid]  # [Nh,C]
+            else:
+                app_valid = None
+            with torch.no_grad():
+                sdfs_v, feats_v = self.neural_sdf.forward(pts_valid)  # [Nh,1],[Nh,K]
+                sdfs_v = sdfs_v.squeeze(-1)  # [Nh]
+                sdfs_v = sdfs_v.view(-1, 1)  # keep 2D for compute_gradients signature
+                grads_v, hess_v = self.neural_sdf.compute_gradients(pts_valid, training=self.training, sdf=sdfs_v)
+            normals_v = torch_F.normalize(grads_v, dim=-1)  # [Nh,3]
+            rgbs_v = self.neural_rgb.forward(pts_valid, normals_v, rays_valid, feats_v, app=app_valid)  # [Nh,3]
+            # Scatter back.
+            rgbs[valid] = rgbs_v
+            gradients[valid] = grads_v
+            if hessians is not None and hess_v is not None:
+                hessians[valid] = hess_v
+        # Mask out invalid rays in final maps.
+        valid_f = valid.float()[..., None]
+        opacity = valid_f  # [B,R,1]
+        depth = t_vals[..., None] * valid_f  # [B,R,1]
+        rgbs = rgbs * valid_f
+        gradients = gradients * valid_f
+        if hessians is not None:
+            hessians = hessians * valid_f
+        # Collect output.
+        output = dict(
+            rgb=rgbs,  # [B,R,3]
+            # sdfs=sdfs[..., 0],  # [B,R]
+            opacity=opacity,  # [B,R,1]/None
+            # surf_pts=surf_pts,  # [B,R,3]
+            # hit_mask=hit_mask,  # [B,R]
+            depth = depth, # [B,R]
+            outside=outside,  # [B,R]
+            # t_vals=t_vals,  # [B,R]
+            gradients=gradients,  # [B,R,3]， 这玩意用来算SDF梯度模长1的约束的， 
+            gradient = gradients,  # [B,R,3]/None， 这玩意用来算法线的
+            hessians=hessians,  # [B,R,3]/None， 这玩意用来算 curvature_loss，对 hessian.sum(dim=-1)（近似拉普拉斯）取绝对值求平均，用来鼓励平滑/低曲率的 SDF。
+        )
+        return output 
+
 
     def render_rays_object(self, center, ray_unit, near, far, outside, app, stratified=False):
         with torch.no_grad():
             dists = self.sample_dists_all(center, ray_unit, near, far, stratified=stratified)  # [B,R,N,3]
         points = camera.get_3D_points_from_dist(center, ray_unit, dists)  # [B,R,N,3]
         sdfs, feats = self.neural_sdf.forward(points)  # [B,R,N,1],[B,R,N,K]
-        debug()
+        # surf_pts, hit_mask, t_vals = self.det_surface(center, ray_unit, near, far)
+        # debug()
         sdfs[outside[..., None].expand_as(sdfs)] = self.outside_val
         # Compute 1st- and 2nd-order gradients.
         rays_unit = ray_unit[..., None, :].expand_as(points).contiguous()  # [B,R,N,3]
@@ -276,8 +372,8 @@ class Model(BaseModel):
         return dists
 
     @torch.no_grad()
-    def det_surface(self, center, ray_unit, near, far, max_steps=128, eps=1e-4, step_scale=0.9):
-        """Sphere tracing to find the first SDF zero crossing along rays.
+    def det_surface(self, center, ray_unit, near, far, max_steps=128, eps=1e-4, step_scale=0.9, refine_steps=3):
+        """Sphere tracing to find the first SDF zero crossing along rays, with optional bisection refinement on sign flips.
         Args:
             center (tensor [B,R,3]): Ray origins.
             ray_unit (tensor [B,R,3]): Normalized ray directions.
@@ -285,17 +381,29 @@ class Model(BaseModel):
             max_steps (int): Maximum sphere tracing iterations.
             eps (float): Convergence threshold on |SDF|.
             step_scale (float): Safety factor on step size to avoid overshooting.
+            refine_steps (int): Bisection steps when a sign flip is observed.
         Returns:
             surface_points (tensor [B,R,3]): NaN where miss or out-of-bounds.
             hit_mask (tensor [B,R]): True where a surface is found within bounds.
             t_vals (tensor [B,R]): Final traced distance values.
         """
+        # Normalize near/far to shape [B,R].
+        if near.dim() > 2:
+            near = near[..., 0]
+        if far.dim() > 2:
+            far = far[..., -1]
+        near = near.squeeze(-1)
+        far = far.squeeze(-1)
+        if near.shape != center.shape[:2] or far.shape != center.shape[:2]:
+            raise ValueError(f"det_surface expects near/far shape {center.shape[:2]}, got {near.shape}, {far.shape}")
         # Initialize travel distance along each ray.
         t_vals = near.clone()  # [B,R]
         hit_mask = torch.zeros_like(near, dtype=torch.bool)  # [B,R]
         surface_points = torch.full_like(center, float("nan"))  # [B,R,3]
         # Early skip rays that start outside the unit sphere intersection range.
         valid = far > near
+        prev_t = None
+        prev_sdf = None
         for _ in range(max_steps):
             if not valid.any() or hit_mask.all():
                 break
@@ -305,14 +413,41 @@ class Model(BaseModel):
             if converged.any():
                 surface_points[converged] = pts[converged]
                 hit_mask[converged] = True
-            # Update steps for unfinished rays.
             unfinished = valid & (~hit_mask)
+            # Optional sign-flip refinement (bisection) to reduce oversteps near sharp features.
+            if prev_sdf is not None and refine_steps > 0:
+                sign_flip = (unfinished & (sdfs * prev_sdf < 0))
+                if sign_flip.any():
+                    # Order the bracket so that low/high follow the sign of prev_sdf.
+                    t_low = torch.where(prev_sdf < 0, prev_t, t_vals)
+                    t_high = torch.where(prev_sdf < 0, t_vals, prev_t)
+                    sdf_low = torch.where(prev_sdf < 0, prev_sdf, sdfs)
+                    sdf_high = torch.where(prev_sdf < 0, sdfs, prev_sdf)
+                    for _ in range(refine_steps):
+                        t_mid = 0.5 * (t_low + t_high)
+                        pts_mid = center + ray_unit * t_mid[..., None]
+                        sdf_mid = self.neural_sdf.sdf(pts_mid)[..., 0]
+                        go_low = (sdf_low * sdf_mid < 0)
+                        t_high = torch.where(go_low, t_mid, t_high)
+                        sdf_high = torch.where(go_low, sdf_mid, sdf_high)
+                        t_low = torch.where(go_low, t_low, t_mid)
+                        sdf_low = torch.where(go_low, sdf_low, sdf_mid)
+                    # Take mid as refined hit.
+                    t_vals = torch.where(sign_flip, t_mid, t_vals)
+                    sdfs = torch.where(sign_flip, sdf_mid, sdfs)
+                    pts = torch.where(sign_flip[..., None], pts_mid, pts)
+                    surface_points[sign_flip] = pts_mid[sign_flip]
+                    hit_mask[sign_flip] = True
+            # Update steps for unfinished rays.
             if not unfinished.any():
                 break
             step = sdfs.abs().clamp_min(eps) * step_scale  # [B,R]
-            t_vals = t_vals + step
+            t_vals = t_vals + step * unfinished.float()
             # Invalidate rays that marched past far bound.
             valid = unfinished & (t_vals <= far)
+            # Cache previous values for refinement.
+            prev_t = t_vals.clone()
+            prev_sdf = sdfs.clone()
         return surface_points, hit_mask, t_vals
 
     def compute_neus_alphas(self, ray_unit, sdfs, gradients, dists, dist_far=None, progress=1., eps=1e-5):
