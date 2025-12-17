@@ -89,6 +89,93 @@ def curvature_loss(hessian, outside=None):
         return laplacian.mean()
 
 
+def _sample_reg_points(model, batch_size, device, num_points=64, need_hessian=False):
+    """Uniform samples in unit sphere for regularization."""
+    dir = torch.randn(batch_size, num_points, 3, device=device)
+    dir = torch_F.normalize(dir, dim=-1)
+    radii = torch.rand(batch_size, num_points, 1, device=device) ** (1.0 / 3.0)
+    pts = dir * radii  # [B,N,3]
+    sdf = model.neural_sdf.sdf(pts)  # [B,N,1]
+    grads, hess = model.neural_sdf.compute_gradients(pts, training=need_hessian, sdf=sdf)
+    return grads, hess
+
+
+def eikonal_loss_total(data, model, num_rand=64, rand_weight=0.5):
+    """Eikonal on rendered samples plus random global samples."""
+    loss_main = eikonal_loss(data["gradients"], outside=data.get("outside", None))
+    grads_rand, _ = _sample_reg_points(model, batch_size=data["rgb"].shape[0], device=data["rgb"].device,
+                                       num_points=num_rand, need_hessian=False)
+    loss_rand = eikonal_loss(grads_rand)
+    return loss_main + loss_rand * rand_weight
+
+
+def curvature_loss_total(data, model, num_rand=32, rand_weight=0.5):
+    """Curvature on rendered samples plus random global samples."""
+    loss_main = curvature_loss(data["hessians"], outside=data.get("outside", None))
+    _, hess_rand = _sample_reg_points(model, batch_size=data["rgb"].shape[0], device=data["rgb"].device,
+                                      num_points=num_rand, need_hessian=True)
+    if hess_rand is not None:
+        loss_main = loss_main + curvature_loss(hess_rand) * rand_weight
+    return loss_main
+
+
+def sdf_shift_loss_continuous(
+    data, model,
+    base_eps=1e-3,
+    step_min=1e-3,
+    step_max=5e-3,
+    temp=0.01,
+    consistency_weight=0.5,
+):
+    if "surf_pts" not in data:
+        return torch.tensor(0.0, device=data["rgb"].device, dtype=data["rgb"].dtype)
+
+    mask = data.get("hit_mask", data["opacity"].squeeze(-1) > 0)  # [B,R]
+    if not mask.any():
+        return torch.tensor(0.0, device=data["rgb"].device, dtype=data["rgb"].dtype)
+
+    rgb    = data["rgb"]           # 必须与 surf_pts 在同一计算图里才有意义
+    rgb_gt = data["image_sampled"]
+    surf_pts = data["surf_pts"]
+
+    # 注意：仅当 rgb 是由这个 surf_pts 计算出来的，这里才会得到非零梯度
+    # if not surf_pts.requires_grad:
+    #     surf_pts = surf_pts.detach().requires_grad_(True)
+
+    mask_f = mask.float()[..., None]
+    color_err = ((rgb - rgb_gt) * mask_f).pow(2).sum()
+
+    grad_x = torch.autograd.grad(
+        color_err, surf_pts,
+        create_graph=False,   # 避免二阶
+        retain_graph=True,
+        allow_unused=True
+    )[0]
+    if grad_x is None:
+        return torch.tensor(0.0, device=rgb.device, dtype=rgb.dtype)
+
+    # 用方向做路由信号：detach
+    dir = torch_F.normalize(grad_x, dim=-1).detach()
+
+    # step 的 clamp 建议作用在 step 本身
+    step = ((rgb - rgb_gt).detach().norm(dim=-1, keepdim=True) * base_eps).clamp(step_min, step_max)
+
+    pts_offset = surf_pts - step * dir   # 梯度下降方向
+
+    sdf_offset = model.neural_sdf.sdf(pts_offset)[..., 0]  # [B,R]
+    m = mask.float()
+    den = m.sum().clamp_min(1.0)
+    loss_shift = (sdf_offset.abs() * m).sum() / den
+
+    if "sdf_surface" in data:
+        sdf_surface = data["sdf_surface"]
+        consistency = ((sdf_surface - sdf_offset.detach()) ** 2 + (sdf_offset - sdf_surface.detach()) ** 2)
+        loss_shift = loss_shift + (consistency * m).sum() / den * consistency_weight
+
+    return loss_shift
+
+
+
 def sdf_shift_loss(sdf_offsets, rgb_offsets, rgb_target, rgb_center):
     """
     Pick the best match among center and lateral samples (up/down/left/right) based on RGB,

@@ -1,4 +1,4 @@
-'''
+''' 
 -----------------------------------------------------------------------------
 Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
@@ -10,14 +10,19 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 -----------------------------------------------------------------------------
 '''
 
+import wandb
 import torch
 import torch.nn.functional as torch_F
-import wandb
 
 from imaginaire.utils.distributed import master_only
 from imaginaire.utils.visualization import wandb_image
 from projects.nerf.trainers.base import BaseTrainer
-from projects.sdf_angelo.utils.misc import get_scheduler, eikonal_loss, curvature_loss, sdf_shift_loss
+from projects.sdf_angelo.utils.misc import (
+    get_scheduler,
+    eikonal_loss_total,
+    curvature_loss_total,
+    sdf_shift_loss_continuous,
+)
 
 from mtools import debug
 
@@ -45,12 +50,12 @@ class Trainer(BaseTrainer):
             self.losses["render"] = self.criteria["render"](data["rgb"], data["image_sampled"]) * 3  # FIXME:sumRGB?!
             self.metrics["psnr"] = -10 * torch_F.mse_loss(data["rgb"], data["image_sampled"]).log10()
             if "eikonal" in self.weights.keys():
-                self.losses["eikonal"] = eikonal_loss(data["gradients"], outside=data["outside"])
+                self.losses["eikonal"] = eikonal_loss_total(data, self.model_module)
             if "curvature" in self.weights:
-                self.losses["curvature"] = curvature_loss(data["hessians"], outside=data["outside"])
-            if "sdf_offsets" in self.weights and "sdf_offsets" in data:
-                # self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"],data["rgb_offsets"],data["image_sampled"])
-                self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"], data["rgb_offsets"], data["image_sampled"], data["rgb"])
+                self.losses["curvature"] = curvature_loss_total(data, self.model_module)
+            # Continuous color-aligned surface refinement.
+            if "sdf_shift" in self.weights and "surf_pts" in data:
+                self.losses["sdf_shift"] = sdf_shift_loss_continuous(data, self.model_module)
 
         else:
             # Compute loss on the entire image.
