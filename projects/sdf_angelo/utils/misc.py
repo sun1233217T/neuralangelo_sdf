@@ -74,7 +74,7 @@ def get_scheduler(cfg_opt, opt):
 def eikonal_loss(gradients, outside=None):
     gradient_error = (gradients.norm(dim=-1) - 1.0) ** 2  # [B,R,N]
     gradient_error = gradient_error.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)  # [B,R,N]
-    if outside is not None:
+    if outside is not None and outside.shape == gradient_error.shape:
         return (gradient_error * (~outside).float()).mean()
     else:
         return gradient_error.mean()
@@ -87,6 +87,44 @@ def curvature_loss(hessian, outside=None):
         return (laplacian * (~outside).float()).mean()
     else:
         return laplacian.mean()
+
+
+def sdf_shift_loss(sdf_offsets, rgb_offsets, rgb_target, rgb_center):
+    """
+    Pick the best match among center and lateral samples (up/down/left/right) based on RGB,
+    and encourage its SDF to be near zero (center assumed zero).
+    Args:
+        sdf_offsets (tensor [B,R,4]): SDF at offsets [+u,-u,+v,-v].
+        rgb_offsets (tensor [B,R,4,3]): RGB at offsets.
+        rgb_target (tensor [B,R,3]): Ground-truth RGB at the center pixel.
+        rgb_center (tensor [B,R,3]): Rendered RGB at the center sample.
+    Returns:
+        scalar loss.
+    """
+    # Color distance: center + 4 offsets.
+    color_dist_center = (rgb_center - rgb_target).abs().mean(dim=-1, keepdim=True)  # [B,R,1]
+    color_dist_offsets = (rgb_offsets - rgb_target[..., None, :]).abs().mean(dim=-1)  # [B,R,4]
+    color_dist = torch.cat([color_dist_center, color_dist_offsets], dim=-1)  # [B,R,5]
+    best_idx = color_dist.argmin(dim=-1, keepdim=True)  # [B,R,1]
+    # SDF list: center assumed 0, offsets as provided.
+    sdf_center = torch.zeros_like(sdf_offsets[..., :1])  # [B,R,1]
+    sdf_all = torch.cat([sdf_center, sdf_offsets], dim=-1)  # [B,R,5]
+    sdf_best = sdf_all.gather(dim=-1, index=best_idx).squeeze(-1)  # [B,R]
+    loss = sdf_best.abs().mean()
+    return loss + color_dist.mean()
+
+def sdf_shift_loss_old(sdf_front, sdf_back, rgb_front, rgb_back, image_sampled):
+
+    # 用颜色误差判断哪个更“像表面”（注意 detach：只用来做路由，不让它自己学崩）
+    err_f = (rgb_front - image_sampled).pow(2).mean(dim=-1)  # [Nh]
+    err_b = (rgb_back - image_sampled).pow(2).mean(dim=-1)  # [Nh]
+
+    # 硬选择：front 更好则选 front，否则选 back
+    choose_front = (err_f < err_b).float().detach()  # [Nh]
+
+    # 让更好的那个点的 |sdf| -> 0，相当于把 0 面往那边拉
+    loss_shift = (choose_front * sdf_front.abs() + (1.0 - choose_front) * sdf_back.abs()).mean()
+    return loss_shift + err_f.mean() + err_b.mean()
 
 
 def get_activation(activ, **kwargs):

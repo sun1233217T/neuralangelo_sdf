@@ -17,7 +17,7 @@ import wandb
 from imaginaire.utils.distributed import master_only
 from imaginaire.utils.visualization import wandb_image
 from projects.nerf.trainers.base import BaseTrainer
-from projects.sdf_angelo.utils.misc import get_scheduler, eikonal_loss, curvature_loss
+from projects.sdf_angelo.utils.misc import get_scheduler, eikonal_loss, curvature_loss, sdf_shift_loss
 
 from mtools import debug
 
@@ -48,6 +48,10 @@ class Trainer(BaseTrainer):
                 self.losses["eikonal"] = eikonal_loss(data["gradients"], outside=data["outside"])
             if "curvature" in self.weights:
                 self.losses["curvature"] = curvature_loss(data["hessians"], outside=data["outside"])
+            if "sdf_offsets" in self.weights and "sdf_offsets" in data:
+                # self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"],data["rgb_offsets"],data["image_sampled"])
+                self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"], data["rgb_offsets"], data["image_sampled"], data["rgb"])
+
         else:
             # Compute loss on the entire image.
             self.losses["render"] = self.criteria["render"](data["rgb_map"], data["image"])

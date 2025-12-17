@@ -196,7 +196,7 @@ class Model(BaseModel):
             output[key] = torch.cat(value, dim=1)
         return output
     
-    def render_ray_surface(self, center, ray_unit, sample_idx=None, stratified=False):
+    def render_ray_surface(self, center, ray_unit, sample_idx=None, stratified=False, sample_eps=1e-3):
         app, app_outside = self.get_appearance_embedding(sample_idx, ray_unit.shape[1])
         with torch.no_grad():
             near, far, outside = self.get_dist_bounds(center, ray_unit)
@@ -206,8 +206,13 @@ class Model(BaseModel):
         valid = hit_mask & (~outside_bool)  # [B,R]
         # Pre-allocate outputs.
         rgbs = torch.zeros(*center.shape[:2], 3, device=center.device, dtype=center.dtype)
+        rgb_offsets = torch.zeros(*center.shape[:2], 4, 3, device=center.device, dtype=center.dtype)  # +u,-u,+v,-v
+        sdf_offsets = torch.zeros(*center.shape[:2], 4, device=center.device, dtype=center.dtype)
         gradients = torch.zeros_like(rgbs)
+        grads_v = torch.zeros_like(rgbs)
         hessians = torch.zeros_like(rgbs) if self.training else None
+        # sample_points: [B,R,5,3] (surface, +u, -u, +v, -v)
+        sample_points = torch.zeros(*center.shape[:2], 5, 3, device=center.device, dtype=center.dtype)
         if valid.any():
             pts_valid = surf_pts[valid]  # [Nh,3]
             rays_valid = ray_unit[valid]  # [Nh,3]
@@ -215,18 +220,48 @@ class Model(BaseModel):
                 app_valid = app[..., 0, :][valid]  # [Nh,C]
             else:
                 app_valid = None
-            with torch.no_grad():
-                sdfs_v, feats_v = self.neural_sdf.forward(pts_valid)  # [Nh,1],[Nh,K]
-                sdfs_v = sdfs_v.squeeze(-1)  # [Nh]
-                sdfs_v = sdfs_v.view(-1, 1)  # keep 2D for compute_gradients signature
-                grads_v, hess_v = self.neural_sdf.compute_gradients(pts_valid, training=self.training, sdf=sdfs_v)
-            normals_v = torch_F.normalize(grads_v, dim=-1)  # [Nh,3]
-            rgbs_v = self.neural_rgb.forward(pts_valid, normals_v, rays_valid, feats_v, app=app_valid)  # [Nh,3]
+            # Build orthonormal basis (u,v) orthogonal to each ray for lateral sampling.
+            helper = torch.tensor([0.0, 0.0, 1.0], device=rays_valid.device, dtype=rays_valid.dtype).expand_as(rays_valid)
+            alt_helper = torch.tensor([1.0, 0.0, 0.0], device=rays_valid.device, dtype=rays_valid.dtype)
+            helper = torch.where((rays_valid.abs().sum(dim=-1, keepdim=True) < 1e-6).expand_as(helper), alt_helper, helper)
+            u = torch_F.normalize(torch.cross(rays_valid, helper, dim=-1), dim=-1)
+            v = torch_F.normalize(torch.cross(rays_valid, u, dim=-1), dim=-1)
+            pts_u_plus = pts_valid + u * sample_eps
+            pts_u_minus = pts_valid - u * sample_eps
+            pts_v_plus = pts_valid + v * sample_eps
+            pts_v_minus = pts_valid - v * sample_eps
+            # Arrange as [5,Nh,3]: surface, +u, -u, +v, -v then scatter.
+            sample_stack = torch.stack([pts_valid, pts_u_plus, pts_u_minus, pts_v_plus, pts_v_minus], dim=0)  # [5,Nh,3]
+            # For downstream outputs keep per-ray grouping.
+            sample_points[valid] = sample_stack.permute(1, 0, 2)  # [Nh,5,3]
+            valid_num = pts_valid.shape[0]
+            # Repeat per-hit attributes for lateral samples.
+            sample_points_flat = sample_stack.view(-1, 3).contiguous()  # [5Nh,3] ordered blocks
+            rays_repeat = torch.cat([rays_valid] * 5, dim=0)  # [5Nh,3]
+            if app_valid is not None:
+                app_repeat = torch.cat([app_valid] * 5, dim=0)  # [5Nh,C]
+            else:
+                app_repeat = None
+            sdfs_v, feats_v = self.neural_sdf.forward(sample_points_flat)  # [5Nh,1],[5Nh,K]
+            sdfs_v = sdfs_v.squeeze(-1)  # [5Nh]
+            sdfs_v = sdfs_v.view(-1, 1)  # keep 2D for compute_gradients signature
+            grads_v, hess_v = self.neural_sdf.compute_gradients(sample_points_flat, training=self.training, sdf=sdfs_v)
+            normals_v = torch_F.normalize(grads_v, dim=-1)  # [5Nh,3]
+            rgbs_v = self.neural_rgb.forward(sample_points_flat, normals_v, rays_repeat, feats_v, app=app_repeat)  # [5Nh,3]
             # Scatter back.
-            rgbs[valid] = rgbs_v
-            gradients[valid] = grads_v
+            rgbs[valid] = rgbs_v[:valid_num]
+            # Offsets: blocks of size valid_num in order [+u, -u, +v, -v].
+            sdf_offsets[valid, 0] = sdfs_v[valid_num:2*valid_num].squeeze(-1)
+            sdf_offsets[valid, 1] = sdfs_v[2*valid_num:3*valid_num].squeeze(-1)
+            sdf_offsets[valid, 2] = sdfs_v[3*valid_num:4*valid_num].squeeze(-1)
+            sdf_offsets[valid, 3] = sdfs_v[4*valid_num:5*valid_num].squeeze(-1)
+            rgb_offsets[valid, 0] = rgbs_v[valid_num:2*valid_num]
+            rgb_offsets[valid, 1] = rgbs_v[2*valid_num:3*valid_num]
+            rgb_offsets[valid, 2] = rgbs_v[3*valid_num:4*valid_num]
+            rgb_offsets[valid, 3] = rgbs_v[4*valid_num:5*valid_num]
+            gradients[valid] = grads_v[:valid_num]
             if hessians is not None and hess_v is not None:
-                hessians[valid] = hess_v
+                hessians[valid] = hess_v[:valid_num]
         # Mask out invalid rays in final maps.
         valid_f = valid.float()[..., None]
         opacity = valid_f  # [B,R,1]
@@ -238,16 +273,18 @@ class Model(BaseModel):
         # Collect output.
         output = dict(
             rgb=rgbs,  # [B,R,3]
-            # sdfs=sdfs[..., 0],  # [B,R]
             opacity=opacity,  # [B,R,1]/None
             # surf_pts=surf_pts,  # [B,R,3]
             # hit_mask=hit_mask,  # [B,R]
             depth = depth, # [B,R]
             outside=outside,  # [B,R]
             # t_vals=t_vals,  # [B,R]
-            gradients=gradients,  # [B,R,3]， 这玩意用来算SDF梯度模长1的约束的， 
+            gradients=grads_v.unsqueeze(0),  # [B,R,3]， 这玩意用来算SDF梯度模长1的约束的， 
             gradient = gradients,  # [B,R,3]/None， 这玩意用来算法线的
             hessians=hessians,  # [B,R,3]/None， 这玩意用来算 curvature_loss，对 hessian.sum(dim=-1)（近似拉普拉斯）取绝对值求平均，用来鼓励平滑/低曲率的 SDF。
+            sample_points=sample_points,  # [B,R,5,3]: surface, +u, -u, +v, -v
+            sdf_offsets=sdf_offsets,      # [B,R,4]: +u, -u, +v, -v
+            rgb_offsets=rgb_offsets,      # [B,R,4,3]
         )
         return output 
 

@@ -10,15 +10,15 @@
 
 logging_iter: 9999999999999  # disable the printing logger
 
-max_iter: 600000
+max_iter: 500000
 
 wandb_scalar_iter: 100
 wandb_image_iter: 10000
-validation_iter: 5000
+validation_iter: 500
 speed_benchmark: False
 
 checkpoint:
-    save_iter: 20000
+    save_iter: 2000
 
 trainer:
     type: projects.sdf_angelo.trainer
@@ -29,6 +29,7 @@ trainer:
         render: 1.0
         eikonal: 0.1
         curvature: 5e-4
+        sdf_shift: 0.01
     init:
         type: none
     amp_config:
