@@ -207,7 +207,7 @@ class Model(BaseModel):
         # Pre-allocate outputs.
         rgbs = torch.zeros(*center.shape[:2], 3, device=center.device, dtype=center.dtype)
         rgb_offsets = torch.zeros(*center.shape[:2], 4, 3, device=center.device, dtype=center.dtype)  # +u,-u,+v,-v
-        sdf_offsets = torch.zeros(*center.shape[:2], 4, device=center.device, dtype=center.dtype)
+        sdf_offsets = torch.zeros(*center.shape[:2], 5, device=center.device, dtype=center.dtype)
         gradients = torch.zeros_like(rgbs)
         grads_v = torch.zeros_like(rgbs)
         hessians = torch.zeros_like(rgbs) if self.training else None
@@ -237,17 +237,23 @@ class Model(BaseModel):
             valid_num = pts_valid.shape[0]
             # Repeat per-hit attributes for lateral samples.
             sample_points_flat = sample_stack.view(-1, 3).contiguous()  # [5Nh,3] ordered blocks
-            rays_repeat = torch.cat([rays_valid] * 5, dim=0)  # [5Nh,3]
+            # Extra random samples inside the unit sphere for a broader eikonal constraint.
+            rand_dir = torch.randn(valid_num, 3, device=pts_valid.device, dtype=pts_valid.dtype)
+            rand_dir = torch_F.normalize(rand_dir, dim=-1)
+            rand_radius = torch.rand(valid_num, 1, device=pts_valid.device, dtype=pts_valid.dtype).pow(1.0 / 3.0)
+            rand_points = rand_dir * rand_radius  # [Nh,3]
+            sample_points_flat = torch.cat([sample_points_flat, rand_points], dim=0)  # [6Nh,3]
+            rays_repeat = torch.cat([rays_valid] * 5 , dim=0)  # [5Nh,3]
             if app_valid is not None:
                 app_repeat = torch.cat([app_valid] * 5, dim=0)  # [5Nh,C]
             else:
                 app_repeat = None
-            sdfs_v, feats_v = self.neural_sdf.forward(sample_points_flat)  # [5Nh,1],[5Nh,K]
-            sdfs_v = sdfs_v.squeeze(-1)  # [5Nh]
+            sdfs_v, feats_v = self.neural_sdf.forward(sample_points_flat)  # [6Nh,1],[6Nh,K]
+            sdfs_v = sdfs_v.squeeze(-1)  # [6Nh]
             sdfs_v = sdfs_v.view(-1, 1)  # keep 2D for compute_gradients signature
             grads_v, hess_v = self.neural_sdf.compute_gradients(sample_points_flat, training=self.training, sdf=sdfs_v)
-            normals_v = torch_F.normalize(grads_v, dim=-1)  # [5Nh,3]
-            rgbs_v = self.neural_rgb.forward(sample_points_flat, normals_v, rays_repeat, feats_v, app=app_repeat)  # [5Nh,3]
+            normals_v = torch_F.normalize(grads_v, dim=-1)  # [6Nh,3]
+            rgbs_v = self.neural_rgb.forward(sample_points_flat[:5*valid_num], normals_v[:5*valid_num], rays_repeat, feats_v[:5*valid_num], app=app_repeat)  # [5Nh,3]
             # Scatter back.
             rgbs[valid] = rgbs_v[:valid_num]
             # Offsets: blocks of size valid_num in order [+u, -u, +v, -v].
@@ -255,6 +261,7 @@ class Model(BaseModel):
             sdf_offsets[valid, 1] = sdfs_v[2*valid_num:3*valid_num].squeeze(-1)
             sdf_offsets[valid, 2] = sdfs_v[3*valid_num:4*valid_num].squeeze(-1)
             sdf_offsets[valid, 3] = sdfs_v[4*valid_num:5*valid_num].squeeze(-1)
+            sdf_offsets[valid, 4] = sdfs_v[:valid_num].squeeze(-1)  # surface sdf
             rgb_offsets[valid, 0] = rgbs_v[valid_num:2*valid_num]
             rgb_offsets[valid, 1] = rgbs_v[2*valid_num:3*valid_num]
             rgb_offsets[valid, 2] = rgbs_v[3*valid_num:4*valid_num]
@@ -279,7 +286,7 @@ class Model(BaseModel):
             depth = depth, # [B,R]
             outside=outside,  # [B,R]
             # t_vals=t_vals,  # [B,R]
-            gradients=grads_v.unsqueeze(0),  # [B,R,3]， 这玩意用来算SDF梯度模长1的约束的， 
+            gradients=grads_v.unsqueeze(0),  # [1,6Nh,3]：表面/偏移/随机点梯度，用于 eikonal 约束
             gradient = gradients,  # [B,R,3]/None， 这玩意用来算法线的
             hessians=hessians,  # [B,R,3]/None， 这玩意用来算 curvature_loss，对 hessian.sum(dim=-1)（近似拉普拉斯）取绝对值求平均，用来鼓励平滑/低曲率的 SDF。
             sample_points=sample_points,  # [B,R,5,3]: surface, +u, -u, +v, -v

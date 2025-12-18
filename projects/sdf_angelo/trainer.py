@@ -48,7 +48,7 @@ class Trainer(BaseTrainer):
                 self.losses["eikonal"] = eikonal_loss(data["gradients"], outside=data["outside"])
             if "curvature" in self.weights:
                 self.losses["curvature"] = curvature_loss(data["hessians"], outside=data["outside"])
-            if "sdf_offsets" in self.weights and "sdf_offsets" in data:
+            if "sdf_shift" in self.weights and "sdf_offsets" in data:
                 # self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"],data["rgb_offsets"],data["image_sampled"])
                 self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"], data["rgb_offsets"], data["image_sampled"], data["rgb"])
 

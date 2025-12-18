@@ -17,6 +17,8 @@ import torch.nn.functional as torch_F
 import imaginaire.trainers.utils
 from torch.optim import lr_scheduler
 
+from mtools import debug
+
 flip_mat = np.array([
     [1, 0, 0, 0],
     [0, -1, 0, 0],
@@ -104,13 +106,15 @@ def sdf_shift_loss(sdf_offsets, rgb_offsets, rgb_target, rgb_center):
     # Color distance: center + 4 offsets.
     color_dist_center = (rgb_center - rgb_target).abs().mean(dim=-1, keepdim=True)  # [B,R,1]
     color_dist_offsets = (rgb_offsets - rgb_target[..., None, :]).abs().mean(dim=-1)  # [B,R,4]
+    # debug()
     color_dist = torch.cat([color_dist_center, color_dist_offsets], dim=-1)  # [B,R,5]
     best_idx = color_dist.argmin(dim=-1, keepdim=True)  # [B,R,1]
     # SDF list: center assumed 0, offsets as provided.
-    sdf_center = torch.zeros_like(sdf_offsets[..., :1])  # [B,R,1]
-    sdf_all = torch.cat([sdf_center, sdf_offsets], dim=-1)  # [B,R,5]
-    sdf_best = sdf_all.gather(dim=-1, index=best_idx).squeeze(-1)  # [B,R]
-    loss = sdf_best.abs().mean()
+    # sdf_center = torch.zeros_like(sdf_offsets[..., :1])  # [B,R,1]
+    # sdf_all = torch.cat([sdf_center, sdf_offsets], dim=-1)  # [B,R,5]
+    sdf_best = sdf_offsets.gather(dim=-1, index=best_idx).squeeze(-1)  # [B,R]
+    sdf_replace_center = sdf_offsets[...,4] - sdf_best
+    loss = sdf_best.abs().mean() + sdf_replace_center.abs().mean()
     return loss + color_dist.mean()
 
 def sdf_shift_loss_old(sdf_front, sdf_back, rgb_front, rgb_back, image_sampled):
