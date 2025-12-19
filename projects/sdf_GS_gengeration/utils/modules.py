@@ -15,9 +15,9 @@ from functools import partial
 import numpy as np
 import tinycudann as tcnn
 
-from projects.sdf_angelo.utils.spherical_harmonics import get_spherical_harmonics
-from projects.sdf_angelo.utils.mlp import MLPforNeuralSDF
-from projects.sdf_angelo.utils.misc import get_activation
+from projects.sdf_GS_gengeration.utils.spherical_harmonics import get_spherical_harmonics
+from projects.sdf_GS_gengeration.utils.mlp import MLPforNeuralSDF
+from projects.sdf_GS_gengeration.utils.misc import get_activation
 from projects.nerf.utils import nerf_util
 
 
@@ -178,16 +178,17 @@ class NeuralSDF(torch.nn.Module):
         return gradient, hessian
 
 
-class NeuralRGB(torch.nn.Module):
+class NeuralGS(torch.nn.Module):
 
-    def __init__(self, cfg_rgb, feat_dim, appear_embed):
+    def __init__(self, cfg_rgb, feat_dim, appear_embed, output_dim):
         super().__init__()
         self.cfg_rgb = cfg_rgb
         self.cfg_appear_embed = appear_embed
+        self.output_dim = output_dim
         encoding_view_dim = self.build_encoding(cfg_rgb.encoding_view)
         input_base_dim = 6 if cfg_rgb.mode == "idr" else 3
         input_dim = input_base_dim + encoding_view_dim + feat_dim + (appear_embed.dim if appear_embed.enabled else 0)
-        self.build_mlp(cfg_rgb.mlp, input_dim=input_dim)
+        self.build_mlp(cfg_rgb.mlp, input_dim=input_dim, output_dim=output_dim)
 
     def build_encoding(self, cfg_encoding_view):
         if cfg_encoding_view.type == "fourier":
@@ -199,9 +200,9 @@ class NeuralRGB(torch.nn.Module):
             raise NotImplementedError("Unknown encoding type")
         return encoding_view_dim
 
-    def build_mlp(self, cfg_mlp, input_dim=3):
-        # RGB prediction
-        layer_dims = [input_dim] + [cfg_mlp.hidden_dim] * cfg_mlp.num_layers + [3]
+    def build_mlp(self, cfg_mlp, input_dim=3, output_dim=3):
+        # RGB + Gaussian parameters prediction
+        layer_dims = [input_dim] + [cfg_mlp.hidden_dim] * cfg_mlp.num_layers + [output_dim]
         activ = get_activation(cfg_mlp.activ, **cfg_mlp.activ_params)
         self.mlp = nerf_util.MLPwithSkipConnection(layer_dims, skip_connection=cfg_mlp.skip, activ=activ,
                                                    use_weightnorm=cfg_mlp.weight_norm)
@@ -216,8 +217,14 @@ class NeuralRGB(torch.nn.Module):
         if self.cfg_rgb.mode == "no_normal":
             input_list.remove(normals)
         input_vec = torch.cat(input_list, dim=-1)
-        rgb = self.mlp(input_vec).sigmoid_()
-        return rgb  # [...,3]
+        raw = self.mlp(input_vec)  # [...,output_dim]
+        # Apply sigmoid only on RGB part; leave the rest to caller for proper activation.
+        rgb = raw[..., :3].sigmoid()
+        if self.output_dim > 3:
+            output = torch.cat([rgb, raw[..., 3:]], dim=-1)
+        else:
+            output = rgb
+        return output  # [...,output_dim]
 
     def encode_view(self, rays_unit):
         if self.cfg_rgb.encoding_view.type == "fourier":

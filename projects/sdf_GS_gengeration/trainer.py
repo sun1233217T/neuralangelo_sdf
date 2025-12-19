@@ -17,7 +17,7 @@ import wandb
 from imaginaire.utils.distributed import master_only
 from imaginaire.utils.visualization import wandb_image
 from projects.nerf.trainers.base import BaseTrainer
-from projects.sdf_angelo.utils.misc import get_scheduler, eikonal_loss, curvature_loss, sdf_shift_loss
+from projects.sdf_GS_gengeration.utils.misc import get_scheduler, eikonal_loss, curvature_loss, sdf_shift_loss
 
 from mtools import debug
 
@@ -40,26 +40,17 @@ class Trainer(BaseTrainer):
         return get_scheduler(cfg.optim, optim)
 
     def _compute_loss(self, data, mode=None):
-        if mode == "train":
-            # Compute loss only on randomly sampled rays.
-            self.losses["render"] = self.criteria["render"](data["rgb"], data["image_sampled"]) * 3  # FIXME:sumRGB?!
-            self.metrics["psnr"] = -10 * torch_F.mse_loss(data["rgb"], data["image_sampled"]).log10()
-            if "eikonal" in self.weights.keys():
-                self.losses["eikonal"] = eikonal_loss(data["gradients"], outside=data["outside"])
-            if "curvature" in self.weights:
-                self.losses["curvature"] = curvature_loss(data["hessians"], outside=data["outside"])
-            if "sdf_shift" in self.weights and "sdf_offsets" in data:
-                # self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"],data["rgb_offsets"],data["image_sampled"])
-                self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"], data["rgb_offsets"], data["image_sampled"], data["rgb"])
-            if "sdf_render" in self.weights and "surface_rgb" in data:
-                self.losses["sdf_render"] = self.criteria["render"](data["surface_rgb"], data["image_sampled"])
-
-        else:
-            # Compute loss on the entire image.
-            self.losses["render"] = self.criteria["render"](data["rgb_map"], data["image"])
-            self.metrics["psnr"] = -10 * torch_F.mse_loss(data["rgb_map"], data["image"]).log10()
-        # for key in self.losses:
-        #     print(f"{mode} loss {key}: {self.losses[key].item()} weight: {self.weights.get(key, 'N/A')}")
+        target = data["image"]
+        pred = data["rgb_map"]
+        self.losses["render"] = self.criteria["render"](pred, target)
+        self.metrics["psnr"] = -10 * torch_F.mse_loss(pred, target).log10()
+        outside = data.get("outside", None)
+        if torch.is_tensor(outside) and outside.dim() > 2:
+            outside = outside.squeeze(-1)
+        if "eikonal" in self.weights.keys():
+            self.losses["eikonal"] = eikonal_loss(data["gradients"], outside=outside)
+        if "curvature" in self.weights and data.get("hessians") is not None:
+            self.losses["curvature"] = curvature_loss(data["hessians"], outside=outside)
 
     def get_curvature_weight(self, current_iteration, init_weight):
         if "curvature" in self.weights:
@@ -103,19 +94,19 @@ class Trainer(BaseTrainer):
     @master_only
     def log_wandb_images(self, data, mode=None, max_samples=None):
         images = {"iteration": self.current_iteration, "epoch": self.current_epoch}
-        if mode == "val":
+        if mode in ("val", "train"):
             images_error = (data["rgb_map"] - data["image"]).abs()
+            depth_vis = 1 / (data["depth_map"] + 1e-8) * self.cfg.trainer.depth_vis_scale
             images.update({
                 f"{mode}/vis/rgb_target": wandb_image(data["image"]),
                 f"{mode}/vis/rgb_render": wandb_image(data["rgb_map"]),
                 f"{mode}/vis/rgb_error": wandb_image(images_error),
+                f"{mode}/vis/depth": wandb_image(depth_vis),
                 f"{mode}/vis/normal": wandb_image(data["normal_map"], from_range=(-1, 1)),
-                f"{mode}/vis/inv_depth": wandb_image(1 / (data["depth_map"] + 1e-8) * self.cfg.trainer.depth_vis_scale),
-                f"{mode}/vis/opacity": wandb_image(data["opacity_map"]),
-                f"{mode}/vis_sdf/rgb_render": wandb_image(data["sdf_rgb_map"]),
-                f"{mode}/vis_sdf/normal": wandb_image(data["sdf_normal_map"], from_range=(-1, 1)),
-                f"{mode}/vis_sdf/inv_depth": wandb_image(1 / (data["sdf_depth_map"] + 1e-8) * self.cfg.trainer.depth_vis_scale),
+                f"{mode}/vis/hit_mask": wandb_image(data["hit_mask"]),
             })
+            if "opacity_map" in data:
+                images[f"{mode}/vis/opacity"] = wandb_image(data["opacity_map"])
         wandb.log(images, step=self.current_iteration)
 
     def train(self, cfg, data_loader, single_gpu=False, profile=False, show_pbar=False):

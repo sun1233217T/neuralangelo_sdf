@@ -65,22 +65,23 @@ class Dataset(base.Dataset):
         # Get the cameras (intrinsics and pose).
         intr, pose = self.cameras[idx] if self.preload else self.get_camera(idx)
         intr, pose = self.preprocess_camera(intr, pose, image_size_raw)
-        # Pre-sample ray indices.
-        if self.split == "train":
-            ray_idx = torch.randperm(self.H * self.W)[:self.num_rays]  # [R]
-            image_sampled = image.flatten(1, 2)[:, ray_idx].t()  # [R,3]
-            sample.update(
-                ray_idx=ray_idx,
-                image_sampled=image_sampled,
-                intr=intr,
-                pose=pose,
-            )
-        else:  # keep image during inference
-            sample.update(
-                image=image,
-                intr=intr,
-                pose=pose,
-            )
+        camera_center = self.get_camera_center(pose)
+        fovx, fovy = self.get_fov(intr)
+        world_view = self.pose_to_homogeneous(pose)
+        proj = self.get_projection_matrix(fovx, fovy)
+        full_proj = proj @ world_view
+        sample.update(
+            image=image,
+            image_height=self.H,
+            image_width=self.W,
+            FoVx=fovx,
+            FoVy=fovy,
+            world_view_transform=world_view.transpose(0, 1).contiguous(),
+            full_proj_transform=full_proj.transpose(0, 1).contiguous(),
+            camera_center=camera_center,
+            intr=intr,
+            pose=pose,
+        )
         return sample
 
     def get_image(self, idx):
@@ -124,6 +125,33 @@ class Dataset(base.Dataset):
         intr[0] *= self.W / raw_W
         intr[1] *= self.H / raw_H
         return intr, pose
+
+    def get_fov(self, intr):
+        fx, fy = intr[0, 0], intr[1, 1]
+        fovx = 2 * torch.atan(torch.tensor(self.W, dtype=intr.dtype) / (2 * fx))
+        fovy = 2 * torch.atan(torch.tensor(self.H, dtype=intr.dtype) / (2 * fy))
+        return fovx, fovy
+
+    def pose_to_homogeneous(self, pose):
+        mat = torch.eye(4, dtype=pose.dtype)
+        mat[:3, :4] = pose
+        return mat
+
+    def get_projection_matrix(self, fovx, fovy, z_near=0.1, z_far=100.0):
+        tan_half_fovx = torch.tan(fovx * 0.5)
+        tan_half_fovy = torch.tan(fovy * 0.5)
+        proj = torch.zeros(4, 4, dtype=fovx.dtype)
+        proj[0, 0] = 1.0 / tan_half_fovx
+        proj[1, 1] = 1.0 / tan_half_fovy
+        proj[2, 2] = z_far / (z_far - z_near)
+        proj[2, 3] = -(z_far * z_near) / (z_far - z_near)
+        proj[3, 2] = 1.0
+        return proj
+
+    def get_camera_center(self, pose):
+        c2w = camera.Pose().invert(pose)
+        center = c2w[:3, 3]
+        return center
 
     def _gl_to_cv(self, gl):
         # convert to CV convention used in Imaginaire
