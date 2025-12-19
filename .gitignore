@@ -31,7 +31,7 @@ checkpoints
 *.ply
 *.out
 *.log
-*.txt
+# *.txt
 
 # log folder
 logs/
@@ -73,6 +73,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+third_party/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
