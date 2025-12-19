@@ -51,6 +51,8 @@ class Trainer(BaseTrainer):
             if "sdf_shift" in self.weights and "sdf_offsets" in data:
                 # self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"],data["rgb_offsets"],data["image_sampled"])
                 self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"], data["rgb_offsets"], data["image_sampled"], data["rgb"])
+            if "sdf_render" in self.weights and "surface_rgb" in data:
+                self.losses["sdf_render"] = self.criteria["render"](data["surface_rgb"], data["image_sampled"])
 
         else:
             # Compute loss on the entire image.
@@ -110,6 +112,9 @@ class Trainer(BaseTrainer):
                 f"{mode}/vis/normal": wandb_image(data["normal_map"], from_range=(-1, 1)),
                 f"{mode}/vis/inv_depth": wandb_image(1 / (data["depth_map"] + 1e-8) * self.cfg.trainer.depth_vis_scale),
                 f"{mode}/vis/opacity": wandb_image(data["opacity_map"]),
+                f"{mode}/vis_sdf/rgb_render": wandb_image(data["sdf_rgb_map"]),
+                f"{mode}/vis_sdf/normal": wandb_image(data["sdf_normal_map"], from_range=(-1, 1)),
+                f"{mode}/vis_sdf/inv_depth": wandb_image(1 / (data["sdf_depth_map"] + 1e-8) * self.cfg.trainer.depth_vis_scale),
             })
         wandb.log(images, step=self.current_iteration)
 

@@ -106,7 +106,6 @@ def sdf_shift_loss(sdf_offsets, rgb_offsets, rgb_target, rgb_center):
     # Color distance: center + 4 offsets.
     color_dist_center = (rgb_center - rgb_target).abs().mean(dim=-1, keepdim=True)  # [B,R,1]
     color_dist_offsets = (rgb_offsets - rgb_target[..., None, :]).abs().mean(dim=-1)  # [B,R,4]
-    # debug()
     color_dist = torch.cat([color_dist_center, color_dist_offsets], dim=-1)  # [B,R,5]
     best_idx = color_dist.argmin(dim=-1, keepdim=True)  # [B,R,1]
     # SDF list: center assumed 0, offsets as provided.

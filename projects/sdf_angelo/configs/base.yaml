@@ -14,11 +14,11 @@ max_iter: 500000
 
 wandb_scalar_iter: 100
 wandb_image_iter: 10000
-validation_iter: 500
+validation_iter: 5000
 speed_benchmark: False
 
 checkpoint:
-    save_iter: 2000
+    save_iter: 20000
 
 trainer:
     type: projects.sdf_angelo.trainer
@@ -29,7 +29,8 @@ trainer:
         render: 1.0
         eikonal: 0.1
         curvature: 5e-4
-        sdf_shift: 0.01
+        # sdf_shift: 0.01
+        sdf_render: 1.0
     init:
         type: none
     amp_config:
@@ -104,7 +105,7 @@ model:
             type: spherical
             levels: 3
     render:
-        rand_rays: 5120
+        rand_rays: 512
         num_samples:
             coarse: 64
             fine: 16
