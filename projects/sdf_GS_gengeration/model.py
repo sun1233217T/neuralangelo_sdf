@@ -18,6 +18,7 @@ from projects.nerf.utils import nerf_util, camera
 from projects.sdf_GS_gengeration.utils.modules import NeuralSDF, NeuralGS
 from projects.sdf_GS_gengeration.utils.gs_render import GaussianModel, Camera, render_analyse
 
+from mtools import debug
 
 class Model(BaseModel):
 
@@ -31,6 +32,7 @@ class Model(BaseModel):
         self.neural_sdf = NeuralSDF(cfg_model.object.sdf)
         self.neural_gs = NeuralGS(cfg_model.object.rgb, feat_dim=cfg_model.object.sdf.mlp.hidden_dim,
                                     appear_embed=cfg_model.appear_embed, output_dim=10)
+        self.s_var = torch.nn.Parameter(torch.tensor(cfg_model.object.s_var.init_val, dtype=torch.float32))
 
     def forward(self, data):
         output = self.render_gaussian_image(data, training=True)
@@ -61,21 +63,24 @@ class Model(BaseModel):
 
         # Run SDF network on surface points.
         points = surface_points[..., None, :]  # [B,HW,1,3]
-        points = torch.nan_to_num(points, nan=0.0)
+        # Replace NaN with 0, detach tracing graph, and enable grad so downstream losses can accumulate dL/dp.
+        points = torch.nan_to_num(points, nan=0.0).detach().requires_grad_(False)
         sdfs, feats = self.neural_sdf.forward(points)
         gradients, hessians = self.neural_sdf.compute_gradients(points, training=training, sdf=sdfs)
         normals = torch_F.normalize(gradients, dim=-1)
         rays_unit_exp = ray_unit[..., None, :].expand_as(points)
 
         # NeuralGS outputs: [rgb(3), quat(4), scale(3)].
-        gauss_params = self.neural_gs.forward(points, normals, rays_unit_exp, feats, app=None)
+        gauss_params = self.neural_gs.forward(points, normals.detach(), rays_unit_exp, feats, app=None)
         colors = gauss_params[..., :3]  # already sigmoid
         quat = gauss_params[..., 3:7]
         scales = gauss_params[..., 7:]
 
-        quat_norm = quat / (quat.norm(dim=-1, keepdim=True) + 1e-8)
-        rot_mats = self.quaternion_to_matrix(quat_norm)  # [B,HW,1,3,3]
-        scales = torch_F.softplus(scales) + 1e-4
+        quat_norm = quat / (quat.norm(dim=-1, keepdim=True) + 1e-8)  # [B,HW,1,4]
+        scales = torch_F.softplus(scales) + 1e-4  # [B,HW,1,3]
+
+        scales = torch.ones_like(scales) * 0.0001  # init to s_var
+        # debug()
 
         # Flatten per batch for rasterizer.
         B = pose.shape[0]
@@ -88,7 +93,7 @@ class Model(BaseModel):
                 continue
             pts_b = points[b].view(-1, 3)[hit]  # [N,3]
             color_b = colors[b].view(-1, 3)[hit]  # [N,3]
-            rot_b = rot_mats[b].view(-1, 3, 3)[hit]  # [N,3,3]
+            rot_b = quat_norm[b].view(-1, 4)[hit]  # [N,4] quaternion expected by rasterizer
             scale_b = scales[b].view(-1, 3)[hit]  # [N,3]
 
             pc = GaussianModel(pts_b, opacity=None, scaling=scale_b, rotation=rot_b, color=color_b)

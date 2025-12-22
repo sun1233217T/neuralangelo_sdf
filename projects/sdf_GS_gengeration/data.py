@@ -29,7 +29,9 @@ class Dataset(base.Dataset):
         cfg_data = cfg.data
         self.root = cfg_data.root
         self.preload = cfg_data.preload
-        self.H, self.W = cfg_data.val.image_size if is_inference else cfg_data.train.image_size
+        self.rescale = getattr(cfg_data, "rescale_factor", 0.5)
+        base_H, base_W = cfg_data.val.image_size if is_inference else cfg_data.train.image_size
+        self.H, self.W = max(1, int(base_H * self.rescale)), max(1, int(base_W * self.rescale))
         meta_fname = f"{cfg_data.root}/transforms.json"
         with open(meta_fname) as file:
             self.meta = json.load(file)

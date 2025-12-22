@@ -79,8 +79,9 @@ class Trainer(BaseTrainer):
         super().log_wandb_scalars(data, mode=mode)
         scalars = {
             f"{mode}/PSNR": self.metrics["psnr"].detach(),
-            f"{mode}/s-var": self.model_module.s_var.item(),
         }
+        if hasattr(self.model_module, "s_var"):
+            scalars[f"{mode}/s-var"] = self.model_module.s_var.item()
         if "curvature" in self.weights:
             scalars[f"{mode}/curvature_weight"] = self.weights["curvature"]
         if "eikonal" in self.weights:

@@ -10,18 +10,18 @@
 
 logging_iter: 9999999999999  # disable the printing logger
 
-max_iter: 500000
+max_iter: 700000
 
 wandb_scalar_iter: 100
 wandb_image_iter: 10000
-validation_iter: 5000
+validation_iter: 1000
 speed_benchmark: False
 
 checkpoint:
     save_iter: 20000
 
 trainer:
-    type: projects.sdf_angelo.trainer
+    type: projects.sdf_GS_gengeration.trainer
     ema_config:
         enabled: False
         load_ema_checkpoint: False
@@ -38,7 +38,7 @@ trainer:
     depth_vis_scale: 0.5
 
 model:
-    type: projects.sdf_angelo.model
+    type: projects.sdf_GS_gengeration.model
     object:
         sdf:
             mlp:
@@ -133,6 +133,7 @@ data:
     root: datasets/nerf-synthetic/lego
     use_multi_epoch_loader: True
     num_workers: 4
+    rescale_factor: 0.5  # resize all images and intrinsics by this factor to save memory
     preload: True
     num_images:  # The number of training images.
     train:

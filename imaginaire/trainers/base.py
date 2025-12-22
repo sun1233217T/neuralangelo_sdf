@@ -32,6 +32,7 @@ from imaginaire.utils.distributed import master_only_print as print
 from imaginaire.utils.distributed import is_master, get_rank
 from imaginaire.utils.set_random_seed import set_random_seed
 
+from mtools import debug
 
 class BaseTrainer(object):
     r"""Base trainer. We expect that all trainers inherit this class.
@@ -603,7 +604,7 @@ class Checkpointer(object):
             sched=self.sched.state_dict(),
         )
 
-    def load(self, checkpoint_path=None, resume=False, load_opt=True, load_sch=True, **kwargs):
+    def load(self, checkpoint_path=None, resume=False, load_opt=True, load_sch=True, strict=None, **kwargs):
         r"""Load network weights, optimizer parameters, scheduler parameters from a checkpoint.
         Args:
             checkpoint_path (str): Path to the checkpoint (local file or S3 key).
@@ -611,9 +612,11 @@ class Checkpointer(object):
                            optimizer/scheduler (optional) are also loaded.
             load_opt (bool): Whether to load the optimizer state dict (resume should be True).
             load_sch (bool): Whether to load the scheduler state dict (resume should be True).
+            strict (bool or None): Whether to strictly enforce state_dict key match. Defaults to cfg.checkpoint.strict_resume.
         """
         # Priority: (1) checkpoint_path (2) latest_path (3) train from scratch.
         self.resume = resume
+        strict_flag = self.strict_resume if strict is None else strict
         # If checkpoint path were not specified, try to load the latest one from the same run.
         if resume and checkpoint_path is None:
             latest_checkpoint_file = self.read_latest_checkpoint_file()
@@ -627,15 +630,50 @@ class Checkpointer(object):
             print(f"Loading checkpoint (local): {checkpoint_path}")
             # Load the state dicts.
             print('- Loading the model...')
-            self.model.load_state_dict(state_dict['model'], strict=self.strict_resume)
+            # print(self.model.module.neural_sdf.mlp.linears[0].weight_g[:20])
+            # print(state_dict['model']['module.neural_sdf.mlp.linears.0.weight_g'][:20])
+            if strict_flag:
+                self.model.load_state_dict(state_dict['model'], strict=True)
+            else:
+                model_state = self.model.state_dict()
+                filtered = {k: v for k, v in state_dict['model'].items()
+                            if k in model_state and v.shape == model_state[k].shape}
+                loaded_keys = len(filtered)
+                missing = [k for k in model_state.keys() if k not in filtered]
+                unexpected = [k for k in state_dict['model'].keys() if k not in model_state]
+                shape_mismatch = [k for k, v in state_dict['model'].items()
+                                  if k in model_state and v.shape != model_state[k].shape]
+                self.model.load_state_dict(filtered, strict=False)
+                print(f'- Loaded {loaded_keys} matching keys (strict=False): {list(filtered.keys())}')
+                if missing:
+                    preview = ', '.join(missing[:10])
+                    print(f'- Skipped {len(missing)} missing keys (strict=False). Sample: {preview}')
+                if unexpected:
+                    preview = ', '.join(unexpected[:10])
+                    print(f'- Skipped {len(unexpected)} unexpected keys (strict=False). Sample: {preview}')
+                if shape_mismatch:
+                    preview = ', '.join(shape_mismatch[:10])
+                    print(f'- Skipped {len(shape_mismatch)} shape-mismatched keys (strict=False). Sample: {preview}')
+                # state_dict['epoch'] = 0
+                # state_dict['iteration'] = 0
+                print('- Not all model parameters were loaded!')
+            # print(self.model.module.neural_sdf.mlp.linears[0].weight_g[:20])
+            
             if resume:
                 self.resume_epoch = state_dict['epoch']
                 self.resume_iteration = state_dict['iteration']
                 self.sched.last_epoch = self.resume_iteration if self.iteration_mode else self.resume_epoch
+                opt_loaded = False
                 if load_opt:
-                    print('- Loading the optimizer...')
-                    self.optim.load_state_dict(state_dict['optim'])
-                if load_sch:
+                    try:
+                        print('- Loading the optimizer...')
+                        self.optim.load_state_dict(state_dict['optim'])
+                        opt_loaded = True
+                    except ValueError as e:
+                        if strict_flag:
+                            raise
+                        print(f'- Skip loading optimizer due to mismatch (strict={strict_flag}): {e}')
+                if load_sch and opt_loaded:
                     print('- Loading the scheduler...')
                     self.sched.load_state_dict(state_dict['sched'])
                 print(f"Done with loading the checkpoint (epoch {self.resume_epoch}, iter {self.resume_iteration}).")

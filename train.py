@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument('--wandb', action='store_true', help="Enable using Weights & Biases as the logger")
     parser.add_argument('--wandb_name', default='default', type=str)
     parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--sdf_bootstrap', action='store_true',
+                        help='Only bootstrap/borrow the SDF network weights from a checkpoint or external source.')
     args, cfg_cmd = parser.parse_known_args()
     return args, cfg_cmd
 
@@ -79,7 +81,7 @@ def main():
     trainer = get_trainer(cfg, is_inference=False, seed=args.seed)
     trainer.set_data_loader(cfg, split="train")
     trainer.set_data_loader(cfg, split="val")
-    trainer.checkpointer.load(args.checkpoint, args.resume, load_sch=True, load_opt=True)
+    trainer.checkpointer.load(args.checkpoint, args.resume, load_sch=True, load_opt=True, strict = not args.sdf_bootstrap)
 
     # Initialize Wandb.
     trainer.init_wandb(cfg,

@@ -8,7 +8,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 # -----------------------------------------------------------------------------
 
-_parent_: projects/sdf_angelo/configs/base.yaml
+_parent_: projects/sdf_GS_gengeration/configs/base.yaml
 
 model:
     object:
@@ -24,8 +24,9 @@ model:
         enabled: False
 
 data:
-    type: projects.sdf_angelo.data
+    type: projects.sdf_GS_gengeration.data
     root: /home/haochen/data/DTU/scan24
+    rescale_factor: 0.25
     train:
         image_size: [1200,1600]
         batch_size: 1
