@@ -3,7 +3,7 @@ GROUP=test
 NAME=sdf_train_test2
 CONFIG=projects/sdf_angelo/configs/${EXPERIMENT}.yaml
 GPUS=1  # use >1 for multi-GPU training!
-CUDA_VISIBLE_DEVICES=4 torchrun --master_port=29503 --nproc_per_node=${GPUS} train.py \
+CUDA_VISIBLE_DEVICES=0 torchrun --master_port=29503 --nproc_per_node=${GPUS} train.py \
     --logdir=logs/${GROUP}/${NAME} \
     --config=${CONFIG} \
     --show_pbar \
@@ -25,3 +25,14 @@ torchrun --nproc_per_node=${GPUS} projects/neuralangelo/scripts/extract_mesh.py 
     --output_file=${OUTPUT_MESH} \
     --resolution=${RESOLUTION} \
     --block_res=${BLOCK_RES}
+
+EXPERIMENT=dtu
+GROUP=test
+NAME=sdf_train_test2
+CONFIG=projects/sdf_angelo/configs/${EXPERIMENT}-win.yaml
+python train.py --single_gpu \
+    --logdir=logs/${GROUP}/${NAME} \
+    --config=${CONFIG} \
+    --show_pbar \
+	--wandb  --wandb_name sdf_train_test\
+	--resume

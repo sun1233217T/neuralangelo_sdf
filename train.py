@@ -54,7 +54,7 @@ def main():
     # If args.single_gpu is set to True, we will disable distributed data parallel.
     if not args.single_gpu:
         # this disables nccl timeout
-        os.environ["NCLL_BLOCKING_WAIT"] = "0"
+        os.environ["NCCL_BLOCKING_WAIT"] = "0"
         os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
         cfg.local_rank = args.local_rank
         init_dist(cfg.local_rank, rank=-1, world_size=-1)
