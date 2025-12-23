@@ -32,6 +32,7 @@ checkpoints
 *.out
 *.log
 # *.txt
+*.svg
 
 # log folder
 logs/
