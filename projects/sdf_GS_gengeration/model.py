@@ -50,74 +50,104 @@ class Model(BaseModel):
         intr = data["intr"]  # [B,3,3]
         H, W = self._get_image_hw(data)
         image_size = (H, W)
+        mask = data.get("mask", None)
 
         # Generate rays for full image.
         center, ray = camera.get_center_and_ray(pose, intr, image_size)  # [B,HW,3]
-        ray_unit = torch_F.normalize(ray, dim=-1)  # [B,HW,3]
-        ray_norm = ray.norm(dim=-1, keepdim=False)  # [B,HW]
+        if mask is None:
+            mask = torch.ones(pose.shape[0], 1, H, W, device=pose.device, dtype=torch.float32)
+        else:
+            mask = mask.to(pose.device)
 
-        # Trace to surface to obtain per-pixel 3D position.
+        B = pose.shape[0]
+        rendered_images = []
+        depth_map = torch.zeros(B, 1, H, W, device=pose.device)
+        normal_map = torch.zeros(B, 3, H, W, device=pose.device)
+        hit_mask_map = torch.zeros(B, 1, H, W, device=pose.device)
+        gradients = torch.zeros(B, H * W, 3, device=pose.device)
+        hessians = torch.zeros(B, H * W, 3, device=pose.device) if training else None
+        outside = torch.ones(B, H * W, device=pose.device, dtype=torch.bool)
+        surface_points = torch.full((B, H * W, 3), float("nan"), device=pose.device)
+        t_vals = torch.zeros(B, H * W, device=pose.device)
+
+        mask_flat = mask.view(B, -1) > 0.5
+        mask_counts = mask_flat.sum(dim=1)
+        if (mask_counts == 0).any():
+            raise ValueError("Mask must have at least one valid pixel per batch for batched tracing.")
+        if not torch.all(mask_counts == mask_counts[0]):
+            raise ValueError("Mask must have the same number of valid pixels per batch for batched tracing.")
+        num_valid = int(mask_counts[0].item())
+        mask_idx = mask_flat.nonzero(as_tuple=False)  # [B*N, 2] -> (b, hw)
+
+        center_sel = center.view(B, H * W, 3)[mask_idx[:, 0], mask_idx[:, 1]].view(B, num_valid, 3)
+        ray_sel = ray.view(B, H * W, 3)[mask_idx[:, 0], mask_idx[:, 1]].view(B, num_valid, 3)
+        ray_unit = torch_F.normalize(ray_sel, dim=-1)
+        ray_norm = ray_sel.norm(dim=-1, keepdim=False)
+
         with torch.no_grad():
-            near, far, outside = self.get_dist_bounds(center, ray_unit)
-            surface_points, hit_mask, t_vals = self.det_surface(center, ray_unit, near, far)
+            near, far, outside_sel = self.get_dist_bounds(center_sel, ray_unit)
+            surface_points_sel, hit_mask_sel, t_vals_sel = self.det_surface(center_sel, ray_unit, near, far)
 
-        # Run SDF network on surface points.
-        points = surface_points[..., None, :]  # [B,HW,1,3]
-        # Replace NaN with 0, detach tracing graph, and enable grad so downstream losses can accumulate dL/dp.
+        points = surface_points_sel[..., None, :]
         points = torch.nan_to_num(points, nan=0.0).detach().requires_grad_(False)
         sdfs, feats = self.neural_sdf.forward(points)
-        gradients, hessians = self.neural_sdf.compute_gradients(points, training=training, sdf=sdfs)
-        normals = torch_F.normalize(gradients, dim=-1)
+        gradients_sel, hessians_sel = self.neural_sdf.compute_gradients(points, training=training, sdf=sdfs)
+        normals_sel = torch_F.normalize(gradients_sel, dim=-1)
         rays_unit_exp = ray_unit[..., None, :].expand_as(points)
 
-        # NeuralGS outputs: [rgb(3), quat(4), scale(3)].
-        gauss_params = self.neural_gs.forward(points, normals.detach(), rays_unit_exp, feats, app=None)
-        colors = gauss_params[..., :3]  # already sigmoid
+        gauss_params = self.neural_gs.forward(points, normals_sel.detach(), rays_unit_exp, feats, app=None)
+        colors = gauss_params[..., :3]
         quat = gauss_params[..., 3:7]
         scales = gauss_params[..., 7:]
 
-        quat_norm = quat / (quat.norm(dim=-1, keepdim=True) + 1e-8)  # [B,HW,1,4]
-        scales = torch_F.softplus(scales) + 1e-4  # [B,HW,1,3]
+        quat_norm = quat / (quat.norm(dim=-1, keepdim=True) + 1e-8)
+        scales = torch_F.softplus(scales) + 1e-4
+        scales = torch.ones_like(scales) * 0.0001
 
-        scales = torch.ones_like(scales) * 0.0001  # init to s_var
-        # debug()
-
-        # Flatten per batch for rasterizer.
-        B = pose.shape[0]
-        rendered_images = []
+        # Render per batch (rasterizer is not batched).
         for b in range(B):
-            hit = hit_mask[b].view(-1)  # [HW]
+            hit = hit_mask_sel[b].view(-1)
             if hit.sum() == 0:
                 bg = torch.ones(3, H, W, device=pose.device) if self.white_background else torch.zeros(3, H, W, device=pose.device)
                 rendered_images.append(bg)
                 continue
-            pts_b = points[b].view(-1, 3)[hit]  # [N,3]
-            color_b = colors[b].view(-1, 3)[hit]  # [N,3]
-            rot_b = quat_norm[b].view(-1, 4)[hit]  # [N,4] quaternion expected by rasterizer
-            scale_b = scales[b].view(-1, 3)[hit]  # [N,3]
-
+            pts_b = points[b].view(-1, 3)[hit]
+            color_b = colors[b].view(-1, 3)[hit]
+            rot_b = quat_norm[b].view(-1, 4)[hit]
+            scale_b = scales[b].view(-1, 3)[hit]
             pc = GaussianModel(pts_b, opacity=None, scaling=scale_b, rotation=rot_b, color=color_b)
             cam = self.build_camera_from_data(data, b)
             bg_color = torch.ones(3, device=pts_b.device) if self.white_background else torch.zeros(3, device=pts_b.device)
             render_out = render_analyse(cam, pc, bg_color=bg_color)
-            img = render_out["render"]  # [3,H,W]
-            rendered_images.append(img)
+            img = render_out["render"]
+            rendered_images.append(img * mask[b])
 
-        rgb_map = torch.stack(rendered_images, dim=0)  # [B,3,H,W]
-        # Depth and normal maps from SDF tracing.
-        depth = (t_vals / (ray_norm + 1e-8)) * hit_mask  # [B,HW]
-        depth_map = depth.view(B, H, W).unsqueeze(1)
-        normal_flat = normals.squeeze(2) * hit_mask[..., None]  # [B,HW,3]
-        normal_map = normal_flat.view(B, H, W, 3).permute(0, 3, 1, 2)
-        hit_mask_map = hit_mask.view(B, H, W).unsqueeze(1).float()
+        depth_sel = (t_vals_sel / (ray_norm + 1e-8)) * hit_mask_sel
+        depth_map.view(B, -1)[mask_idx[:, 0], mask_idx[:, 1]] = depth_sel.reshape(-1)
+        normal_flat_sel = normals_sel.squeeze(2) * hit_mask_sel[..., None]
+        normal_map.permute(0, 2, 3, 1).reshape(B, -1, 3)[mask_idx[:, 0], mask_idx[:, 1]] = normal_flat_sel.reshape(-1, 3)
+        hit_mask_map.view(B, -1)[mask_idx[:, 0], mask_idx[:, 1]] = hit_mask_sel.reshape(-1).float()
+        gradients.view(B, -1, 3)[mask_idx[:, 0], mask_idx[:, 1]] = gradients_sel.squeeze(2).reshape(-1, 3)
+        if training and hessians_sel is not None:
+            hessians.view(B, -1, 3)[mask_idx[:, 0], mask_idx[:, 1]] = hessians_sel.squeeze(2).reshape(-1, 3)
+        outside.view(B, -1)[mask_idx[:, 0], mask_idx[:, 1]] = outside_sel.reshape(-1)
+        surface_points.view(B, -1, 3)[mask_idx[:, 0], mask_idx[:, 1]] = surface_points_sel.reshape(-1, 3)
+        t_vals.view(B, -1)[mask_idx[:, 0], mask_idx[:, 1]] = t_vals_sel.reshape(-1)
 
+        rgb_map = torch.stack(rendered_images, dim=0)
+
+        grad_out = gradients.squeeze(2) if gradients.dim() == 4 else gradients
+        if training and hessians is not None:
+            hess_out = hessians.squeeze(2) if hessians.dim() == 4 else hessians
+        else:
+            hess_out = None
         output = dict(
             rgb_map=rgb_map,
             depth_map=depth_map,
             normal_map=normal_map,
             hit_mask=hit_mask_map,
-            gradients=gradients.squeeze(2),
-            hessians=hessians.squeeze(2) if (training and hessians is not None) else None,
+            gradients=grad_out,
+            hessians=hess_out,
             outside=outside,
             surface_points=surface_points,
             t_vals=t_vals,

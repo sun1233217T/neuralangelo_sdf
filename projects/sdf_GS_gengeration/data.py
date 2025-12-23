@@ -29,7 +29,7 @@ class Dataset(base.Dataset):
         cfg_data = cfg.data
         self.root = cfg_data.root
         self.preload = cfg_data.preload
-        self.rescale = getattr(cfg_data, "rescale_factor", 0.5)
+        self.rescale = getattr(cfg_data, "rescale_factor", 1.0)
         base_H, base_W = cfg_data.val.image_size if is_inference else cfg_data.train.image_size
         self.H, self.W = max(1, int(base_H * self.rescale)), max(1, int(base_W * self.rescale))
         meta_fname = f"{cfg_data.root}/transforms.json"
@@ -42,6 +42,10 @@ class Dataset(base.Dataset):
             self.list = [self.list[i] for i in subset_idx]
         self.num_rays = cfg.model.render.rand_rays
         self.readjust = getattr(cfg_data, "readjust", None)
+        if self.split == "train":
+            self.cut_scale = getattr(cfg_data.train, "cut_scale", 1.0)
+        else:
+            self.cut_scale = 1.0
         # Preload dataset if possible.
         if cfg_data.preload:
             self.images = self.preload_threading(self.get_image, cfg_data.num_workers)
@@ -64,6 +68,8 @@ class Dataset(base.Dataset):
         # Get the images.
         image, image_size_raw = self.images[idx] if self.preload else self.get_image(idx)
         image = self.preprocess_image(image)
+        mask = self._build_mask()
+        image = image * mask
         # Get the cameras (intrinsics and pose).
         intr, pose = self.cameras[idx] if self.preload else self.get_camera(idx)
         intr, pose = self.preprocess_camera(intr, pose, image_size_raw)
@@ -74,6 +80,7 @@ class Dataset(base.Dataset):
         full_proj = proj @ world_view
         sample.update(
             image=image,
+            mask=mask,
             image_height=self.H,
             image_width=self.W,
             FoVx=fovx,
@@ -85,6 +92,20 @@ class Dataset(base.Dataset):
             pose=pose,
         )
         return sample
+
+    def _build_mask(self):
+        if self.cut_scale is None or self.cut_scale >= 1.0:
+            return torch.ones(1, self.H, self.W, dtype=torch.float32)
+        cut_scale = max(0.0, float(self.cut_scale))
+        crop_h = max(1, int(self.H * cut_scale))
+        crop_w = max(1, int(self.W * cut_scale))
+        max_top = max(0, self.H - crop_h)
+        max_left = max(0, self.W - crop_w)
+        top = int(torch.randint(0, max_top + 1, (1,)).item())
+        left = int(torch.randint(0, max_left + 1, (1,)).item())
+        mask = torch.zeros(1, self.H, self.W, dtype=torch.float32)
+        mask[:, top:top + crop_h, left:left + crop_w] = 1.0
+        return mask
 
     def get_image(self, idx):
         fpath = self.list[idx]["file_path"]

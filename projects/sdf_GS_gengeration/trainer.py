@@ -42,8 +42,16 @@ class Trainer(BaseTrainer):
     def _compute_loss(self, data, mode=None):
         target = data["image"]
         pred = data["rgb_map"]
-        self.losses["render"] = self.criteria["render"](pred, target)
-        self.metrics["psnr"] = -10 * torch_F.mse_loss(pred, target).log10()
+        mask = data.get("mask", None)
+        if mask is not None:
+            mask = mask.to(pred.device)
+            denom = mask.sum().clamp_min(1.0)
+            self.losses["render"] = ((pred - target).abs() * mask).sum() / denom
+            mse = ((pred - target) ** 2 * mask).sum() / denom
+            self.metrics["psnr"] = -10 * mse.clamp_min(1e-12).log10()
+        else:
+            self.losses["render"] = self.criteria["render"](pred, target)
+            self.metrics["psnr"] = -10 * torch_F.mse_loss(pred, target).log10()
         outside = data.get("outside", None)
         if torch.is_tensor(outside) and outside.dim() > 2:
             outside = outside.squeeze(-1)

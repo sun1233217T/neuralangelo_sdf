@@ -22,6 +22,9 @@ checkpoint:
 
 trainer:
     type: projects.sdf_GS_gengeration.trainer
+    profile: False
+    cprofile: True
+    cprofile_output: train.prof
     ema_config:
         enabled: False
         load_ema_checkpoint: False
@@ -133,13 +136,13 @@ data:
     root: datasets/nerf-synthetic/lego
     use_multi_epoch_loader: True
     num_workers: 4
-    rescale_factor: 0.5  # resize all images and intrinsics by this factor to save memory
     preload: True
     num_images:  # The number of training images.
     train:
         image_size: [800,800]
         batch_size: 2
         subset:
+        cut_scale: 1.0
     val:
         image_size: [400,400]
         batch_size: 2

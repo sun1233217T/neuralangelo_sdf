@@ -12,6 +12,8 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import argparse
 import os
+import cProfile
+import pstats
 
 import imaginaire.config
 from imaginaire.config import Config, recursive_update_strict, parse_cmdline_arguments
@@ -92,11 +94,36 @@ def main():
 
     trainer.mode = 'train'
     # Start training.
-    trainer.train(cfg,
-                  trainer.train_data_loader,
-                  single_gpu=args.single_gpu,
-                  profile=args.profile,
-                  show_pbar=args.show_pbar)
+    profile_enabled = args.profile or getattr(cfg.trainer, "profile", False)
+    cprofile_enabled = getattr(cfg.trainer, "cprofile", False)
+    cprofile_output = getattr(cfg.trainer, "cprofile_output", "train.prof")
+    if cprofile_enabled and is_master():
+        profiler = cProfile.Profile()
+        profiler.enable()
+        try:
+            trainer.train(cfg,
+                        trainer.train_data_loader,
+                        single_gpu=args.single_gpu,
+                        profile=profile_enabled,
+                        show_pbar=args.show_pbar)
+        except KeyboardInterrupt:
+            print("Training interrupted by user.")
+        profiler.disable()
+        prof_path = os.path.join(cfg.logdir, cprofile_output)
+        profiler.dump_stats(prof_path)
+        stats = pstats.Stats(profiler).sort_stats("cumtime")
+        print(stats.print_stats(30))
+        print(f"cProfile saved to {prof_path}")
+        print("To view the profiling results, run the following command:")
+        print(f"    python -m pstats {prof_path}")
+        print("or use SnakeViz for a graphical interface:")
+        print(f"    snakeviz -s {prof_path}")
+    else:
+        trainer.train(cfg,
+                      trainer.train_data_loader,
+                      single_gpu=args.single_gpu,
+                      profile=profile_enabled,
+                      show_pbar=args.show_pbar)
 
     # Finalize training.
     trainer.finalize(cfg)

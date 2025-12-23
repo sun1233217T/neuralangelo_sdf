@@ -26,7 +26,6 @@ data:
     type: projects.sdf_GS_gengeration.data
     root: datasets/tanks_and_temples/Barn
     num_images: 410  # The number of training images.
-    rescale_factor: 0.5
     train:
         image_size: [835,1500]
         batch_size: 1

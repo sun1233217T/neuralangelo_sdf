@@ -26,7 +26,6 @@ model:
 data:
     type: projects.sdf_GS_gengeration.data
     root: /home/haochen/data/DTU/scan24
-    rescale_factor: 0.25
     train:
         image_size: [1200,1600]
         batch_size: 1
