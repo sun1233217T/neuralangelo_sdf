@@ -10,6 +10,7 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 -----------------------------------------------------------------------------
 '''
 
+import math
 import torch
 import torch.nn.functional as torch_F
 import wandb
@@ -73,6 +74,7 @@ class Trainer(BaseTrainer):
     def _start_of_iteration(self, data, current_iteration):
         model = self.model_module
         self.progress = model.progress = current_iteration / self.cfg.max_iter
+        model.current_iteration = current_iteration
         if self.cfg.model.object.sdf.encoding.coarse2fine.enabled:
             model.neural_sdf.set_active_levels(current_iteration)
             if self.cfg_gradient.mode == "numerical":
@@ -119,5 +121,51 @@ class Trainer(BaseTrainer):
         wandb.log(images, step=self.current_iteration)
 
     def train(self, cfg, data_loader, single_gpu=False, profile=False, show_pbar=False):
+        self._apply_epoch_config(cfg, data_loader)
         self.progress = self.model_module.progress = self.current_iteration / self.cfg.max_iter
         super().train(cfg, data_loader, single_gpu, profile, show_pbar)
+
+    def _apply_epoch_config(self, cfg, data_loader):
+        if not getattr(cfg.trainer, "epoch_based", False):
+            return
+        batch_size = cfg.data.train.batch_size
+        samples_per_epoch = getattr(cfg.trainer, "samples_per_epoch", None)
+        iters_per_epoch = getattr(cfg.trainer, "iters_per_epoch", None)
+        if iters_per_epoch is None:
+            if samples_per_epoch is not None:
+                iters_per_epoch = int(math.ceil(samples_per_epoch / float(batch_size)))
+            else:
+                iters_per_epoch = len(data_loader)
+        cfg.trainer.iters_per_epoch = iters_per_epoch
+
+        def to_iter(epoch_val):
+            if epoch_val is None:
+                return None
+            return int(epoch_val * iters_per_epoch)
+
+        if getattr(cfg, "max_epoch", None) is not None:
+            cfg.max_iter = to_iter(cfg.max_epoch)
+        if getattr(cfg, "wandb_scalar_epoch", None) is not None:
+            cfg.wandb_scalar_iter = to_iter(cfg.wandb_scalar_epoch)
+        if getattr(cfg, "wandb_image_epoch", None) is not None:
+            cfg.wandb_image_iter = to_iter(cfg.wandb_image_epoch)
+        if getattr(cfg, "validation_epoch", None) is not None:
+            cfg.validation_iter = to_iter(cfg.validation_epoch)
+        if getattr(cfg.checkpoint, "save_epoch", None) is not None:
+            cfg.checkpoint.save_iter = to_iter(cfg.checkpoint.save_epoch)
+
+        sched = cfg.optim.sched
+        if getattr(sched, "warm_up_epoch", None) is not None:
+            sched.warm_up_end = to_iter(sched.warm_up_epoch)
+        if getattr(sched, "two_steps_epoch", None) is not None:
+            sched.two_steps = [to_iter(v) for v in sched.two_steps_epoch]
+        if getattr(sched, "max_epoch", None) is not None:
+            sched.max_iter = to_iter(sched.max_epoch)
+
+        c2f = cfg.model.object.sdf.encoding.coarse2fine
+        if getattr(c2f, "step_epoch", None) is not None:
+            c2f.step = to_iter(c2f.step_epoch)
+
+        self.warm_up_end = cfg.optim.sched.warm_up_end
+        if hasattr(self.model.module, "neural_sdf"):
+            self.model.module.neural_sdf.warm_up_end = self.warm_up_end

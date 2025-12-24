@@ -357,7 +357,7 @@ class BaseTrainer(object):
             self.sched.step()
         elapsed_epoch_time = time.time() - self.start_epoch_time
         # Logging.
-        print('Epoch: {}, total time: {:6f}.'.format(current_epoch, elapsed_epoch_time))
+        # print('Epoch: {}, total time: {:6f}.'.format(current_epoch, elapsed_epoch_time))
         self.timer.time_epoch = elapsed_epoch_time
         self._end_of_epoch(data, current_epoch, current_iteration)
 
@@ -487,14 +487,15 @@ class BaseTrainer(object):
 
         self.timer.checkpoint_tic()  # start timer
         self.timer.reset_timeout_counter()
-        for current_epoch in range(start_epoch, cfg.max_epoch):
+        if show_pbar:
+            epoch_iter = tqdm(range(start_epoch, cfg.max_epoch), desc="Training epochs", leave=False)
+        else:
+            epoch_iter = range(start_epoch, cfg.max_epoch)
+        for current_epoch in epoch_iter:
             if not single_gpu:
                 data_loader.sampler.set_epoch(current_epoch)
             self.start_of_epoch(current_epoch)
-            if show_pbar:
-                data_loader_wrapper = tqdm(data_loader, desc=f"Training epoch {current_epoch + 1}", leave=False)
-            else:
-                data_loader_wrapper = data_loader
+            data_loader_wrapper = data_loader
             for it, data in enumerate(data_loader_wrapper):
                 with profiler.profile(enabled=profile,
                                       use_cuda=True,
@@ -506,7 +507,7 @@ class BaseTrainer(object):
 
                     current_iteration += 1
                     if show_pbar:
-                        data_loader_wrapper.set_postfix(iter=current_iteration)
+                        epoch_iter.set_postfix(iter=current_iteration)
                     if it == len(data_loader) - 1:
                         self.end_of_iteration(data, current_epoch + 1, current_iteration)
                     else:

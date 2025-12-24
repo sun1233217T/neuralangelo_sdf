@@ -30,6 +30,8 @@ class BaseTrainer(BaseTrainer):
         # The below configs should be properly overridden.
         cfg.setdefault("wandb_scalar_iter", 9999999999999)
         cfg.setdefault("wandb_image_iter", 9999999999999)
+        cfg.setdefault("wandb_scalar_epoch", 9999999999999)
+        cfg.setdefault("wandb_image_epoch", 9999999999999)
         cfg.setdefault("validation_epoch", 9999999999999)
         cfg.setdefault("validation_iter", 9999999999999)
 
@@ -38,6 +40,31 @@ class BaseTrainer(BaseTrainer):
         self.weights = {key: value for key, value in cfg.trainer.loss_weight.items() if value}
 
     def _end_of_iteration(self, data, current_epoch, current_iteration):
+        if getattr(self.cfg.trainer, "epoch_based", False):
+            iters_per_epoch = getattr(self.cfg.trainer, "iters_per_epoch", None)
+            if not iters_per_epoch:
+                return
+            scalar_interval = self.cfg.wandb_scalar_epoch * iters_per_epoch
+            image_interval = self.cfg.wandb_image_epoch * iters_per_epoch
+            val_interval = self.cfg.validation_epoch * iters_per_epoch
+            if scalar_interval and current_iteration % scalar_interval == 0:
+                self.timer.time_iteration = self.elapsed_iteration_time / scalar_interval
+                self.elapsed_iteration_time = 0
+                self.log_wandb_scalars(data, mode="train")
+                if is_master() and self.losses["total"].isnan():
+                    self.finalize(self.cfg)
+                    raise ValueError("Training loss has gone to NaN!!!")
+                if is_master() and self.losses["total"].isinf():
+                    self.finalize(self.cfg)
+                    raise ValueError("Training loss has gone to infinity!!!")
+            if image_interval and current_iteration % image_interval == 0:
+                self.log_wandb_images(data, mode="train")
+            if val_interval and current_iteration % val_interval == 0:
+                data_all = self.test(self.eval_data_loader, mode="val")
+                if is_master():
+                    self.log_wandb_scalars(data_all, mode="val")
+                    self.log_wandb_images(data_all, mode="val", max_samples=self.cfg.data.val.max_viz_samples)
+            return
         # Log to wandb.
         if current_iteration % self.cfg.wandb_scalar_iter == 0:
             # Compute the elapsed time (as in the original base trainer).
@@ -63,6 +90,8 @@ class BaseTrainer(BaseTrainer):
                 self.log_wandb_images(data_all, mode="val", max_samples=self.cfg.data.val.max_viz_samples)
 
     def _end_of_epoch(self, data, current_epoch, current_iteration):
+        if getattr(self.cfg.trainer, "epoch_based", False):
+            return
         # Run validation on val set.
         if current_epoch % self.cfg.validation_epoch == 0:
             data_all = self.test(self.eval_data_loader, mode="val")
@@ -103,8 +132,18 @@ class BaseTrainer(BaseTrainer):
     def train(self, cfg, data_loader, single_gpu=False, profile=False, show_pbar=False):
         self.current_epoch = self.checkpointer.resume_epoch or self.current_epoch
         self.current_iteration = self.checkpointer.resume_iteration or self.current_iteration
-        if ((self.current_epoch % self.cfg.validation_epoch == 0 or
-             self.current_iteration % self.cfg.validation_iter == 0)):
+        epoch_based = getattr(self.cfg.trainer, "epoch_based", False)
+        if epoch_based:
+            iters_per_epoch = getattr(self.cfg.trainer, "iters_per_epoch", None)
+            if iters_per_epoch:
+                val_interval = self.cfg.validation_epoch * iters_per_epoch
+                should_validate = (self.current_iteration % val_interval == 0)
+            else:
+                should_validate = False
+        else:
+            should_validate = ((self.current_epoch % self.cfg.validation_epoch == 0 or
+                                self.current_iteration % self.cfg.validation_iter == 0))
+        if should_validate:
             # Do an initial validation.
             data_all = self.test(self.eval_data_loader, mode="val", show_pbar=show_pbar)
             # Log the results to W&B.

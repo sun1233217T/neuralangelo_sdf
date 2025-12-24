@@ -45,6 +45,40 @@ class Model(BaseModel):
         self.sample_dists_from_pdf = partial(nerf_util.sample_dists_from_pdf,
                                              intvs_fine=cfg_model.render.num_samples.fine)
         self.to_full_val_image = partial(misc.to_full_image, image_size=cfg_data.val.image_size)
+        self.current_iteration = 0
+        self._init_surface_cache(cfg_model)
+
+    def _init_surface_cache(self, cfg_model):
+        cache_cfg = getattr(cfg_model.object.sdf, "surface_cache", None)
+        self.surface_cache_enabled = bool(getattr(cache_cfg, "enabled", False))
+        self.surface_cache_reset_interval = getattr(cache_cfg, "reset_interval", 2000)
+        self.surface_cache_max_steps = getattr(cache_cfg, "cache_max_steps", 8)
+        self.surface_cache_device = getattr(cache_cfg, "device", "cpu")
+        self.use_cache_on_hit_ratio = getattr(cache_cfg, "use_cache_on_hit_ratio", 0.5)
+        self.surface_cache = {}
+        self.surface_cache_last_reset_iter = -1
+
+    def _maybe_reset_surface_cache(self):
+        if not self.surface_cache_enabled:
+            return
+        reset_interval = self.surface_cache_reset_interval
+        if reset_interval is None or reset_interval <= 0:
+            return
+        if self.current_iteration == 0:
+            return
+        if self.current_iteration % reset_interval != 0:
+            return
+        if self.surface_cache_last_reset_iter == self.current_iteration:
+            return
+        self.surface_cache.clear()
+        self.surface_cache_last_reset_iter = self.current_iteration
+
+    def _get_surface_cache_entry(self, sample_idx, num_pixels, dtype=torch.float32):
+        entry = self.surface_cache.get(sample_idx)
+        if entry is None or entry.numel() != num_pixels:
+            entry = torch.full((num_pixels,), float("nan"), device=self.surface_cache_device, dtype=dtype)
+            self.surface_cache[sample_idx] = entry
+        return entry
 
     def build_model(self, cfg_model, cfg_data):
         # appearance encoding
@@ -135,15 +169,16 @@ class Model(BaseModel):
         center = nerf_util.slice_by_ray_idx(center, ray_idx)  # [B,R,3]
         ray = nerf_util.slice_by_ray_idx(ray, ray_idx)  # [B,R,3]
         ray_unit = torch_F.normalize(ray, dim=-1)  # [B,R,3]
-        output = self.render_rays(center, ray_unit, sample_idx=sample_idx, stratified=stratified)
+        output = self.render_rays(center, ray_unit, sample_idx=sample_idx, stratified=stratified, ray_idx=ray_idx)
         return output
 
-    def render_rays(self, center, ray_unit, sample_idx=None, stratified=False):
+    def render_rays(self, center, ray_unit, sample_idx=None, stratified=False, ray_idx=None):
         with torch.no_grad():
             near, far, outside = self.get_dist_bounds(center, ray_unit)
-            surf_pts, hit_mask, t_vals = self.det_surface(center, ray_unit, near, far)
+            surf_pts, hit_mask, t_vals = self.det_surface(center, ray_unit, near, far,
+                                                          sample_idx=sample_idx, ray_idx=ray_idx)
         app, app_outside = self.get_appearance_embedding(sample_idx, ray_unit.shape[1])
-        output_object = self.render_rays_object(center, ray_unit, near, far, outside, app, stratified=stratified, surf_pts_t = t_vals, hit_mask = hit_mask)
+        output_object = self.render_rays_object(center, ray_unit, near, far, outside, app, stratified=stratified, surf_pts_t = t_vals)
         if self.with_background:
             output_background = self.render_rays_background(center, ray_unit, far, app_outside, stratified=stratified)
             # Concatenate object and background samples.
@@ -179,141 +214,141 @@ class Model(BaseModel):
         )
         return output
     
-    def render_pixels_surface(self, pose, intr, image_size, stratified=False, sample_idx=None, ray_idx=None):
-        center, ray = camera.get_center_and_ray(pose, intr, image_size)  # [B,HW,3]
-        center = nerf_util.slice_by_ray_idx(center, ray_idx)  # [B,R,3]
-        ray = nerf_util.slice_by_ray_idx(ray, ray_idx)  # [B,R,3]
-        ray_unit = torch_F.normalize(ray, dim=-1)  # [B,R,3]
-        output = self.render_ray_surface(center, ray_unit, sample_idx=sample_idx, stratified=stratified)
-        return output
+    # def render_pixels_surface(self, pose, intr, image_size, stratified=False, sample_idx=None, ray_idx=None):
+    #     center, ray = camera.get_center_and_ray(pose, intr, image_size)  # [B,HW,3]
+    #     center = nerf_util.slice_by_ray_idx(center, ray_idx)  # [B,R,3]
+    #     ray = nerf_util.slice_by_ray_idx(ray, ray_idx)  # [B,R,3]
+    #     ray_unit = torch_F.normalize(ray, dim=-1)  # [B,R,3]
+    #     output = self.render_ray_surface(center, ray_unit, sample_idx=sample_idx, stratified=stratified)
+    #     return output
     
-    def rander_image_surface(self, pose, intr, image_size, stratified=False, sample_idx=None):
-        """ Render the rays given the camera intrinsics and poses.
-        Args:
-            pose (tensor [batch,3,4]): Camera poses ([R,t]).
-            intr (tensor [batch,3,3]): Camera intrinsics.
-            stratified (bool): Whether to stratify the depth sampling.
-            sample_idx (tensor [batch]): Data sample index.
-        Returns:
-            output: A dictionary containing the outputs.
-        """
+    # def rander_image_surface(self, pose, intr, image_size, stratified=False, sample_idx=None):
+    #     """ Render the rays given the camera intrinsics and poses.
+    #     Args:
+    #         pose (tensor [batch,3,4]): Camera poses ([R,t]).
+    #         intr (tensor [batch,3,3]): Camera intrinsics.
+    #         stratified (bool): Whether to stratify the depth sampling.
+    #         sample_idx (tensor [batch]): Data sample index.
+    #     Returns:
+    #         output: A dictionary containing the outputs.
+    #     """
 
-        output = defaultdict(list)
-        for center, ray, _ in self.ray_generator(pose, intr, image_size, full_image=True):
-            ray_unit = torch_F.normalize(ray, dim=-1)  # [B,R,3]
-            output_batch = self.render_rays(center, ray_unit, sample_idx=sample_idx, stratified=stratified)
-            for key, value in output_batch.items():
-                if value is not None:
-                    output[key].append(value.detach())
-        # Concat each item (list) in output into one tensor. Concatenate along the ray dimension (1)
-        for key, value in output.items():
-            output[key] = torch.cat(value, dim=1)
-        return output
+    #     output = defaultdict(list)
+    #     for center, ray, _ in self.ray_generator(pose, intr, image_size, full_image=True):
+    #         ray_unit = torch_F.normalize(ray, dim=-1)  # [B,R,3]
+    #         output_batch = self.render_rays(center, ray_unit, sample_idx=sample_idx, stratified=stratified)
+    #         for key, value in output_batch.items():
+    #             if value is not None:
+    #                 output[key].append(value.detach())
+    #     # Concat each item (list) in output into one tensor. Concatenate along the ray dimension (1)
+    #     for key, value in output.items():
+    #         output[key] = torch.cat(value, dim=1)
+    #     return output
     
-    def render_ray_surface(self, center, ray_unit, sample_idx=None, stratified=False, sample_eps=1e-3):
-        app, app_outside = self.get_appearance_embedding(sample_idx, ray_unit.shape[1])
-        with torch.no_grad():
-            near, far, outside = self.get_dist_bounds(center, ray_unit)
-            surf_pts, hit_mask, t_vals = self.det_surface(center, ray_unit, near, far)
-        # Only evaluate valid hits to avoid NaNs and unnecessary compute.
-        outside_bool = outside.squeeze(-1) if outside.dim() > 2 else outside  # [B,R]
-        valid = hit_mask & (~outside_bool)  # [B,R]
-        # Pre-allocate outputs.
-        rgbs = torch.zeros(*center.shape[:2], 3, device=center.device, dtype=center.dtype)
-        rgb_offsets = torch.zeros(*center.shape[:2], 4, 3, device=center.device, dtype=center.dtype)  # +u,-u,+v,-v
-        sdf_offsets = torch.zeros(*center.shape[:2], 5, device=center.device, dtype=center.dtype)
-        gradients = torch.zeros_like(rgbs)
-        grads_v = torch.zeros_like(rgbs)
-        hessians = torch.zeros_like(rgbs) if self.training else None
-        # sample_points: [B,R,5,3] (surface, +u, -u, +v, -v)
-        sample_points = torch.zeros(*center.shape[:2], 5, 3, device=center.device, dtype=center.dtype)
-        if valid.any():
-            pts_valid = surf_pts[valid]  # [Nh,3]
-            rays_valid = ray_unit[valid]  # [Nh,3]
-            if app is not None:
-                app_valid = app[..., 0, :][valid]  # [Nh,C]
-            else:
-                app_valid = None
-            # Build orthonormal basis (u,v) orthogonal to each ray for lateral sampling.
-            helper = torch.tensor([0.0, 0.0, 1.0], device=rays_valid.device, dtype=rays_valid.dtype).expand_as(rays_valid)
-            alt_helper = torch.tensor([1.0, 0.0, 0.0], device=rays_valid.device, dtype=rays_valid.dtype)
-            helper = torch.where((rays_valid.abs().sum(dim=-1, keepdim=True) < 1e-6).expand_as(helper), alt_helper, helper)
-            u = torch_F.normalize(torch.cross(rays_valid, helper, dim=-1), dim=-1)
-            v = torch_F.normalize(torch.cross(rays_valid, u, dim=-1), dim=-1)
-            pts_u_plus = pts_valid + u * sample_eps
-            pts_u_minus = pts_valid - u * sample_eps
-            pts_v_plus = pts_valid + v * sample_eps
-            pts_v_minus = pts_valid - v * sample_eps
-            # Arrange as [5,Nh,3]: surface, +u, -u, +v, -v then scatter.
-            sample_stack = torch.stack([pts_valid, pts_u_plus, pts_u_minus, pts_v_plus, pts_v_minus], dim=0)  # [5,Nh,3]
-            # For downstream outputs keep per-ray grouping.
-            sample_points[valid] = sample_stack.permute(1, 0, 2)  # [Nh,5,3]
-            valid_num = pts_valid.shape[0]
-            # Repeat per-hit attributes for lateral samples.
-            sample_points_flat = sample_stack.view(-1, 3).contiguous()  # [5Nh,3] ordered blocks
-            # Extra random samples inside the unit sphere for a broader eikonal constraint.
-            rand_dir = torch.randn(valid_num, 3, device=pts_valid.device, dtype=pts_valid.dtype)
-            rand_dir = torch_F.normalize(rand_dir, dim=-1)
-            rand_radius = torch.rand(valid_num, 1, device=pts_valid.device, dtype=pts_valid.dtype).pow(1.0 / 3.0)
-            rand_points = rand_dir * rand_radius  # [Nh,3]
-            sample_points_flat = torch.cat([sample_points_flat, rand_points], dim=0)  # [6Nh,3]
-            rays_repeat = torch.cat([rays_valid] * 5 , dim=0)  # [5Nh,3]
-            if app_valid is not None:
-                app_repeat = torch.cat([app_valid] * 5, dim=0)  # [5Nh,C]
-            else:
-                app_repeat = None
-            sdfs_v, feats_v = self.neural_sdf.forward(sample_points_flat)  # [6Nh,1],[6Nh,K]
-            sdfs_v = sdfs_v.squeeze(-1)  # [6Nh]
-            sdfs_v = sdfs_v.view(-1, 1)  # keep 2D for compute_gradients signature
-            grads_v, hess_v = self.neural_sdf.compute_gradients(sample_points_flat, training=self.training, sdf=sdfs_v)
-            normals_v = torch_F.normalize(grads_v, dim=-1)  # [6Nh,3]
-            rgbs_v = self.neural_rgb.forward(sample_points_flat[:5*valid_num], normals_v[:5*valid_num], rays_repeat, feats_v[:5*valid_num], app=app_repeat)  # [5Nh,3]
-            # Scatter back.
-            rgbs[valid] = rgbs_v[:valid_num]
-            # Offsets: blocks of size valid_num in order [+u, -u, +v, -v].
-            sdf_offsets[valid, 0] = sdfs_v[valid_num:2*valid_num].squeeze(-1)
-            sdf_offsets[valid, 1] = sdfs_v[2*valid_num:3*valid_num].squeeze(-1)
-            sdf_offsets[valid, 2] = sdfs_v[3*valid_num:4*valid_num].squeeze(-1)
-            sdf_offsets[valid, 3] = sdfs_v[4*valid_num:5*valid_num].squeeze(-1)
-            sdf_offsets[valid, 4] = sdfs_v[:valid_num].squeeze(-1)  # surface sdf
-            rgb_offsets[valid, 0] = rgbs_v[valid_num:2*valid_num]
-            rgb_offsets[valid, 1] = rgbs_v[2*valid_num:3*valid_num]
-            rgb_offsets[valid, 2] = rgbs_v[3*valid_num:4*valid_num]
-            rgb_offsets[valid, 3] = rgbs_v[4*valid_num:5*valid_num]
-            gradients[valid] = grads_v[:valid_num]
-            if hessians is not None and hess_v is not None:
-                hessians[valid] = hess_v[:valid_num]
-        # Mask out invalid rays in final maps.
-        valid_f = valid.float()[..., None]
-        opacity = valid_f  # [B,R,1]
-        depth = t_vals[..., None] * valid_f  # [B,R,1]
-        rgbs = rgbs * valid_f
-        gradients = gradients * valid_f
-        if hessians is not None:
-            hessians = hessians * valid_f
-        # Collect output.
-        output = dict(
-            rgb=rgbs,  # [B,R,3]
-            opacity=opacity,  # [B,R,1]/None
-            # surf_pts=surf_pts,  # [B,R,3]
-            # hit_mask=hit_mask,  # [B,R]
-            depth = depth, # [B,R]
-            outside=outside,  # [B,R]
-            # t_vals=t_vals,  # [B,R]
-            gradients=grads_v.unsqueeze(0),  # [1,6Nh,3]：表面/偏移/随机点梯度，用于 eikonal 约束
-            gradient = gradients,  # [B,R,3]/None， 这玩意用来算法线的
-            hessians=hessians,  # [B,R,3]/None， 这玩意用来算 curvature_loss，对 hessian.sum(dim=-1)（近似拉普拉斯）取绝对值求平均，用来鼓励平滑/低曲率的 SDF。
-            sample_points=sample_points,  # [B,R,5,3]: surface, +u, -u, +v, -v
-            sdf_offsets=sdf_offsets,      # [B,R,5]: +u, -u, +v, -v, surface(center)
-            rgb_offsets=rgb_offsets,      # [B,R,4,3]
-        )
-        return output 
+    # def render_ray_surface(self, center, ray_unit, sample_idx=None, stratified=False, sample_eps=1e-3):
+    #     app, app_outside = self.get_appearance_embedding(sample_idx, ray_unit.shape[1])
+    #     with torch.no_grad():
+    #         near, far, outside = self.get_dist_bounds(center, ray_unit)
+    #         surf_pts, hit_mask, t_vals = self.det_surface(center, ray_unit, near, far)
+    #     # Only evaluate valid hits to avoid NaNs and unnecessary compute.
+    #     outside_bool = outside.squeeze(-1) if outside.dim() > 2 else outside  # [B,R]
+    #     valid = hit_mask & (~outside_bool)  # [B,R]
+    #     # Pre-allocate outputs.
+    #     rgbs = torch.zeros(*center.shape[:2], 3, device=center.device, dtype=center.dtype)
+    #     rgb_offsets = torch.zeros(*center.shape[:2], 4, 3, device=center.device, dtype=center.dtype)  # +u,-u,+v,-v
+    #     sdf_offsets = torch.zeros(*center.shape[:2], 5, device=center.device, dtype=center.dtype)
+    #     gradients = torch.zeros_like(rgbs)
+    #     grads_v = torch.zeros_like(rgbs)
+    #     hessians = torch.zeros_like(rgbs) if self.training else None
+    #     # sample_points: [B,R,5,3] (surface, +u, -u, +v, -v)
+    #     sample_points = torch.zeros(*center.shape[:2], 5, 3, device=center.device, dtype=center.dtype)
+    #     if valid.any():
+    #         pts_valid = surf_pts[valid]  # [Nh,3]
+    #         rays_valid = ray_unit[valid]  # [Nh,3]
+    #         if app is not None:
+    #             app_valid = app[..., 0, :][valid]  # [Nh,C]
+    #         else:
+    #             app_valid = None
+    #         # Build orthonormal basis (u,v) orthogonal to each ray for lateral sampling.
+    #         helper = torch.tensor([0.0, 0.0, 1.0], device=rays_valid.device, dtype=rays_valid.dtype).expand_as(rays_valid)
+    #         alt_helper = torch.tensor([1.0, 0.0, 0.0], device=rays_valid.device, dtype=rays_valid.dtype)
+    #         helper = torch.where((rays_valid.abs().sum(dim=-1, keepdim=True) < 1e-6).expand_as(helper), alt_helper, helper)
+    #         u = torch_F.normalize(torch.cross(rays_valid, helper, dim=-1), dim=-1)
+    #         v = torch_F.normalize(torch.cross(rays_valid, u, dim=-1), dim=-1)
+    #         pts_u_plus = pts_valid + u * sample_eps
+    #         pts_u_minus = pts_valid - u * sample_eps
+    #         pts_v_plus = pts_valid + v * sample_eps
+    #         pts_v_minus = pts_valid - v * sample_eps
+    #         # Arrange as [5,Nh,3]: surface, +u, -u, +v, -v then scatter.
+    #         sample_stack = torch.stack([pts_valid, pts_u_plus, pts_u_minus, pts_v_plus, pts_v_minus], dim=0)  # [5,Nh,3]
+    #         # For downstream outputs keep per-ray grouping.
+    #         sample_points[valid] = sample_stack.permute(1, 0, 2)  # [Nh,5,3]
+    #         valid_num = pts_valid.shape[0]
+    #         # Repeat per-hit attributes for lateral samples.
+    #         sample_points_flat = sample_stack.view(-1, 3).contiguous()  # [5Nh,3] ordered blocks
+    #         # Extra random samples inside the unit sphere for a broader eikonal constraint.
+    #         rand_dir = torch.randn(valid_num, 3, device=pts_valid.device, dtype=pts_valid.dtype)
+    #         rand_dir = torch_F.normalize(rand_dir, dim=-1)
+    #         rand_radius = torch.rand(valid_num, 1, device=pts_valid.device, dtype=pts_valid.dtype).pow(1.0 / 3.0)
+    #         rand_points = rand_dir * rand_radius  # [Nh,3]
+    #         sample_points_flat = torch.cat([sample_points_flat, rand_points], dim=0)  # [6Nh,3]
+    #         rays_repeat = torch.cat([rays_valid] * 5 , dim=0)  # [5Nh,3]
+    #         if app_valid is not None:
+    #             app_repeat = torch.cat([app_valid] * 5, dim=0)  # [5Nh,C]
+    #         else:
+    #             app_repeat = None
+    #         sdfs_v, feats_v = self.neural_sdf.forward(sample_points_flat)  # [6Nh,1],[6Nh,K]
+    #         sdfs_v = sdfs_v.squeeze(-1)  # [6Nh]
+    #         sdfs_v = sdfs_v.view(-1, 1)  # keep 2D for compute_gradients signature
+    #         grads_v, hess_v = self.neural_sdf.compute_gradients(sample_points_flat, training=self.training, sdf=sdfs_v)
+    #         normals_v = torch_F.normalize(grads_v, dim=-1)  # [6Nh,3]
+    #         rgbs_v = self.neural_rgb.forward(sample_points_flat[:5*valid_num], normals_v[:5*valid_num], rays_repeat, feats_v[:5*valid_num], app=app_repeat)  # [5Nh,3]
+    #         # Scatter back.
+    #         rgbs[valid] = rgbs_v[:valid_num]
+    #         # Offsets: blocks of size valid_num in order [+u, -u, +v, -v].
+    #         sdf_offsets[valid, 0] = sdfs_v[valid_num:2*valid_num].squeeze(-1)
+    #         sdf_offsets[valid, 1] = sdfs_v[2*valid_num:3*valid_num].squeeze(-1)
+    #         sdf_offsets[valid, 2] = sdfs_v[3*valid_num:4*valid_num].squeeze(-1)
+    #         sdf_offsets[valid, 3] = sdfs_v[4*valid_num:5*valid_num].squeeze(-1)
+    #         sdf_offsets[valid, 4] = sdfs_v[:valid_num].squeeze(-1)  # surface sdf
+    #         rgb_offsets[valid, 0] = rgbs_v[valid_num:2*valid_num]
+    #         rgb_offsets[valid, 1] = rgbs_v[2*valid_num:3*valid_num]
+    #         rgb_offsets[valid, 2] = rgbs_v[3*valid_num:4*valid_num]
+    #         rgb_offsets[valid, 3] = rgbs_v[4*valid_num:5*valid_num]
+    #         gradients[valid] = grads_v[:valid_num]
+    #         if hessians is not None and hess_v is not None:
+    #             hessians[valid] = hess_v[:valid_num]
+    #     # Mask out invalid rays in final maps.
+    #     valid_f = valid.float()[..., None]
+    #     opacity = valid_f  # [B,R,1]
+    #     depth = t_vals[..., None] * valid_f  # [B,R,1]
+    #     rgbs = rgbs * valid_f
+    #     gradients = gradients * valid_f
+    #     if hessians is not None:
+    #         hessians = hessians * valid_f
+    #     # Collect output.
+    #     output = dict(
+    #         rgb=rgbs,  # [B,R,3]
+    #         opacity=opacity,  # [B,R,1]/None
+    #         # surf_pts=surf_pts,  # [B,R,3]
+    #         # hit_mask=hit_mask,  # [B,R]
+    #         depth = depth, # [B,R]
+    #         outside=outside,  # [B,R]
+    #         # t_vals=t_vals,  # [B,R]
+    #         gradients=grads_v.unsqueeze(0),  # [1,6Nh,3]：表面/偏移/随机点梯度，用于 eikonal 约束
+    #         gradient = gradients,  # [B,R,3]/None， 这玩意用来算法线的
+    #         hessians=hessians,  # [B,R,3]/None， 这玩意用来算 curvature_loss，对 hessian.sum(dim=-1)（近似拉普拉斯）取绝对值求平均，用来鼓励平滑/低曲率的 SDF。
+    #         sample_points=sample_points,  # [B,R,5,3]: surface, +u, -u, +v, -v
+    #         sdf_offsets=sdf_offsets,      # [B,R,5]: +u, -u, +v, -v, surface(center)
+    #         rgb_offsets=rgb_offsets,      # [B,R,4,3]
+    #     )
+    #     return output 
 
 
-    def render_rays_object(self, center, ray_unit, near, far, outside, app, stratified=False, surf_pts_t=None, hit_mask=None, surf_p_sample_n = 3, surf_p_sample_eps = 1e-3):
+    def render_rays_object(self, center, ray_unit, near, far, outside, app, stratified=False, surf_pts_t=None, surf_p_sample_n = 3, surf_p_sample_eps = 1e-3):
         with torch.no_grad():
             dists, surface_idx = self.sample_dists_all(center, ray_unit, near, far, stratified=stratified,
-                                           surf_pts_t = surf_pts_t, hit_mask=hit_mask, surf_p_sample_n = surf_p_sample_n, surf_p_sample_eps = surf_p_sample_eps)  # [B,R,N,3]
+                                           surf_pts_t = surf_pts_t, surf_p_sample_n = surf_p_sample_n, surf_p_sample_eps = surf_p_sample_eps)  # [B,R,N,3]
         points = camera.get_3D_points_from_dist(center, ray_unit, dists)  # [B,R,N,3]
         sdfs, feats = self.neural_sdf.forward(points)  # [B,R,N,1],[B,R,N,K]
         # surf_pts, hit_mask, t_vals = self.det_surface(center, ray_unit, near, far)
@@ -401,7 +436,7 @@ class Model(BaseModel):
     @torch.no_grad()
     def sample_dists_all(
             self, center, ray_unit, near, far, stratified=False,
-            surf_pts_t=None, hit_mask=None, surf_p_sample_n=3, surf_p_sample_eps=1e-3
+            surf_pts_t=None, surf_p_sample_n=3, surf_p_sample_eps=1e-3
         ):
         dists = nerf_util.sample_dists(ray_unit.shape[:2], dist_range=(near[..., None], far[..., None]),
                                        intvs=self.cfg_render.num_samples.coarse, stratified=stratified)
@@ -473,7 +508,8 @@ class Model(BaseModel):
         return dists
 
     @torch.no_grad()
-    def det_surface(self, center, ray_unit, near, far, max_steps=128, eps=1e-4, step_scale=0.9, refine_steps=3):
+    def det_surface(self, center, ray_unit, near, far, max_steps=128, eps=1e-4, step_scale=0.9, refine_steps=3,
+                    sample_idx=None, ray_idx=None):
         """Sphere tracing to find the first SDF zero crossing along rays, with optional bisection refinement on sign flips.
         Args:
             center (tensor [B,R,3]): Ray origins.
@@ -501,8 +537,78 @@ class Model(BaseModel):
         t_vals = near.clone()  # [B,R]
         hit_mask = torch.zeros_like(near, dtype=torch.bool)  # [B,R]
         surface_points = torch.full_like(center, float("nan"))  # [B,R,3]
+        cache_enabled = (self.surface_cache_enabled and sample_idx is not None and ray_idx is not None)
+        cached_mask = None
+        if cache_enabled:
+            self._maybe_reset_surface_cache()
+            num_pixels = int(self.image_size_train[0]) * int(self.image_size_train[1])
+            if sample_idx.dim() == 0:
+                sample_idx = sample_idx[None]
+            if ray_idx.dim() == 1:
+                ray_idx = ray_idx[None].expand(sample_idx.shape[0], -1)
+            ray_idx_cpu = ray_idx.detach().to(self.surface_cache_device, non_blocking=True)
+            t_cached_list = []
+            for b, idx in enumerate(sample_idx.tolist()):
+                entry = self._get_surface_cache_entry(idx, num_pixels)
+                t_cached_list.append(entry.index_select(0, ray_idx_cpu[b]))
+            t_cached = torch.stack(t_cached_list, dim=0).to(center.device, non_blocking=True)
+            cached_mask = torch.isfinite(t_cached)
+            if cached_mask.any():
+                t_cached = torch.max(torch.min(t_cached, far), near)
+                t_vals = torch.where(cached_mask, t_cached, t_vals)
+            if cached_mask.sum().item() / cached_mask.numel() < self.use_cache_on_hit_ratio:
+                cached_mask = None  # Disable cache if too few rays hit.
         # Early skip rays that start outside the unit sphere intersection range.
         valid = far > near
+        if cache_enabled and cached_mask is not None and cached_mask.any():
+            print(f"Using surface cache for {cached_mask.sum().item()} / {cached_mask.numel()} rays.")
+            prev_t = None
+            prev_sdf = None
+            valid_cached = valid & cached_mask
+            for _ in range(self.surface_cache_max_steps):
+                if not valid_cached.any() or hit_mask.all():
+                    break
+                pts = center + ray_unit * t_vals[..., None]  # [B,R,3]
+                sdfs = self.neural_sdf.sdf(pts)[..., 0]  # [B,R]
+                converged = (sdfs.abs() < eps) & valid_cached & (~hit_mask)
+                if converged.any():
+                    surface_points[converged] = pts[converged]
+                    hit_mask[converged] = True
+                unfinished = valid_cached & (~hit_mask)
+                # Optional sign-flip refinement (bisection) to reduce oversteps near sharp features.
+                if prev_sdf is not None and refine_steps > 0:
+                    sign_flip = (unfinished & (sdfs * prev_sdf < 0))
+                    if sign_flip.any():
+                        # Order the bracket so that low/high follow the sign of prev_sdf.
+                        t_low = torch.where(prev_sdf < 0, prev_t, t_vals)
+                        t_high = torch.where(prev_sdf < 0, t_vals, prev_t)
+                        sdf_low = torch.where(prev_sdf < 0, prev_sdf, sdfs)
+                        sdf_high = torch.where(prev_sdf < 0, sdfs, prev_sdf)
+                        for _ in range(refine_steps):
+                            t_mid = 0.5 * (t_low + t_high)
+                            pts_mid = center + ray_unit * t_mid[..., None]
+                            sdf_mid = self.neural_sdf.sdf(pts_mid)[..., 0]
+                            go_low = (sdf_low * sdf_mid < 0)
+                            t_high = torch.where(go_low, t_mid, t_high)
+                            sdf_high = torch.where(go_low, sdf_mid, sdf_high)
+                            t_low = torch.where(go_low, t_low, t_mid)
+                            sdf_low = torch.where(go_low, sdf_low, sdf_mid)
+                        # Take mid as refined hit.
+                        t_vals = torch.where(sign_flip, t_mid, t_vals)
+                        sdfs = torch.where(sign_flip, sdf_mid, sdfs)
+                        pts = torch.where(sign_flip[..., None], pts_mid, pts)
+                        surface_points[sign_flip] = pts_mid[sign_flip]
+                        hit_mask[sign_flip] = True
+                # Update steps for unfinished rays.
+                if not unfinished.any():
+                    break
+                step = sdfs.abs().clamp_min(eps) * step_scale  # [B,R]
+                t_vals = t_vals + step * unfinished.float()
+                # Invalidate rays that marched past far bound.
+                valid_cached = unfinished & (t_vals <= far)
+                # Cache previous values for refinement.
+                prev_t = t_vals.clone()
+                prev_sdf = sdfs.clone()
         prev_t = None
         prev_sdf = None
         for _ in range(max_steps):
@@ -549,6 +655,14 @@ class Model(BaseModel):
             # Cache previous values for refinement.
             prev_t = t_vals.clone()
             prev_sdf = sdfs.clone()
+        if cache_enabled:
+            t_vals_cpu = t_vals.detach().to(self.surface_cache_device)
+            hit_cpu = hit_mask.detach().to(self.surface_cache_device)
+            for b, idx in enumerate(sample_idx.tolist()):
+                if not hit_cpu[b].any():
+                    continue
+                entry = self._get_surface_cache_entry(idx, num_pixels)
+                entry[ray_idx_cpu[b][hit_cpu[b]]] = t_vals_cpu[b][hit_cpu[b]]
         return surface_points, hit_mask, t_vals
 
     def compute_neus_alphas(self, ray_unit, sdfs, gradients, dists, dist_far=None, progress=1., eps=1e-5):
