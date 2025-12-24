@@ -78,6 +78,16 @@ model:
             gradient:
                 mode: numerical
                 taps: 4
+            surface_coarse:
+                enabled: False
+                num_samples: 32
+                stratified: False
+            surface_refine:
+                enabled: True
+                steps: 4
+                eps: 1e-4
+            surface_samples:
+                enabled: True
             surface_cache:
                 enabled: False  #目前咋还是减速的
                 reset_interval: 99999999
