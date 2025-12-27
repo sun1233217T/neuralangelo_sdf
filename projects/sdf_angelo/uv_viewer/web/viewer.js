@@ -19,6 +19,7 @@ const viewerEl = document.getElementById("viewer");
 
 const controls = {
   mode: "trackball",
+  invert: true,
   radius: 2,
   target: null,
   offset: null,
@@ -45,7 +46,8 @@ function updateStatus(note) {
   if (note) {
     lines.push(note);
   }
-  lines.push(`Mode: ${controls.mode}`);
+  const invertLabel = controls.invert ? " (invert)" : "";
+  lines.push(`Mode: ${controls.mode}${invertLabel}`);
   lines.push(`Render FPS: ${formatNumber(renderFps, 1)}`);
   if (lastStats) {
     if (lastStats.update_fps !== undefined) {
@@ -338,7 +340,8 @@ function trackballRotate(curr) {
     return;
   }
   const axisWorld = axisCam.clone().applyQuaternion(camera.quaternion);
-  rotateCamera(axisWorld, angle);
+  const rotSign = controls.invert ? -1 : 1;
+  rotateCamera(axisWorld, angle * rotSign);
   controls.dragStart = curr;
 }
 
@@ -379,20 +382,21 @@ function attachControls() {
     const rotateStep = event.shiftKey ? 0.12 : 0.06;
     const rollStep = event.shiftKey ? 0.12 : 0.06;
     const zoomStep = event.shiftKey ? 0.86 : 0.93;
+    const rotSign = controls.invert ? -1 : 1;
     const viewDir = controls.offset.clone().normalize();
     const rightDir = new THREE.Vector3().crossVectors(controls.up, viewDir).normalize();
     if (key === "i") {
-      rotateCamera(rightDir, rotateStep);
+      rotateCamera(rightDir, rotateStep * rotSign);
     } else if (key === "k") {
-      rotateCamera(rightDir, -rotateStep);
+      rotateCamera(rightDir, -rotateStep * rotSign);
     } else if (key === "j") {
-      rotateCamera(controls.up.clone(), rotateStep);
+      rotateCamera(controls.up.clone(), rotateStep * rotSign);
     } else if (key === "l") {
-      rotateCamera(controls.up.clone(), -rotateStep);
+      rotateCamera(controls.up.clone(), -rotateStep * rotSign);
     } else if (key === "u") {
-      rotateCamera(viewDir, rollStep);
+      rotateCamera(viewDir, rollStep * rotSign);
     } else if (key === "o") {
-      rotateCamera(viewDir, -rollStep);
+      rotateCamera(viewDir, -rollStep * rotSign);
     } else if (key === "=" || key === "+") {
       controls.offset.multiplyScalar(zoomStep);
       updateCameraFromOffset();
