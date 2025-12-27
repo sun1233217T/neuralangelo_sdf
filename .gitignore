@@ -33,6 +33,8 @@ checkpoints
 *.log
 # *.txt
 *.svg
+*.mtl
+*.obj
 
 # log folder
 logs/

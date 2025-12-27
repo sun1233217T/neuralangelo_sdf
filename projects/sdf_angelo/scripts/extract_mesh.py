@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import numpy as np
+import trimesh
 from functools import partial
 
 sys.path.append(os.getcwd())
@@ -22,7 +23,7 @@ from imaginaire.config import Config, recursive_update_strict, parse_cmdline_arg
 from imaginaire.utils.distributed import init_dist, get_world_size, is_master, master_only_print as print  # noqa: E402
 from imaginaire.utils.gpu_affinity import set_affinity  # noqa: E402
 from imaginaire.trainers.utils.get_trainer import get_trainer  # noqa: E402
-from projects.neuralangelo.utils.mesh import extract_mesh, extract_texture  # noqa: E402
+from projects.sdf_angelo.utils.mesh import extract_mesh, extract_texture, bake_uv_texture, prepare_mesh_for_uv  # noqa: E402
 
 
 def parse_args():
@@ -33,8 +34,38 @@ def parse_args():
     parser.add_argument('--single_gpu', action='store_true')
     parser.add_argument("--resolution", default=512, type=int, help="Marching cubes resolution")
     parser.add_argument("--block_res", default=64, type=int, help="Block-wise resolution for marching cubes")
+    parser.add_argument("--input_mesh", default="", type=str,
+                        help="Use a pre-cropped mesh instead of extracting from SDF")
+    parser.add_argument("--input_mesh_space", choices=["world", "normalized"], default="world",
+                        help="Coordinate space of input mesh")
+    parser.add_argument("--bounds_scale", default=1.0, type=float,
+                        help="Uniform scale factor applied to extraction bounds (centered)")
     parser.add_argument("--output_file", default="mesh.ply", type=str, help="Output file name")
     parser.add_argument("--textured", action="store_true", help="Export mesh with texture")
+    parser.add_argument("--uv_textured", action="store_true",
+                        help="Export mesh with UV texture (xatlas + neural bake)")
+    parser.add_argument("--texture_size", default=2048, type=int, help="UV texture resolution")
+    parser.add_argument("--bake_batch", default=65536, type=int, help="Batch size for neural texture bake")
+    parser.add_argument("--uv_raster", choices=["gpu", "cpu"], default="gpu",
+                        help="Rasterization backend for UV bake")
+    parser.add_argument("--uv_remesh", action="store_true",
+                        help="Apply isotropic remesh with pymeshlab during UV preprocess")
+    parser.add_argument("--uv_remesh_target_len", default=0.0, type=float,
+                        help="Target edge length for isotropic remesh (0 to auto)")
+    parser.add_argument("--uv_remesh_iters", default=10, type=int,
+                        help="Iterations for isotropic remesh")
+    parser.add_argument("--uv_remesh_position", choices=["before", "after"], default="after",
+                        help="Run remesh before or after final target-face simplification")
+    parser.add_argument("--simplify_only", action="store_true",
+                        help="Export simplified mesh without UV baking")
+    parser.add_argument("--skip_uv_preprocess", action="store_true",
+                        help="Skip UV preprocess (simplify/LCC)")
+    parser.add_argument("--uv_target_faces", default=0, type=int,
+                        help="Optional face count target for UV bake decimation")
+    parser.add_argument("--uv_max_faces", default=500000, type=int,
+                        help="Auto-decimate when face count exceeds this threshold (0 to disable)")
+    parser.add_argument("--uv_no_lcc", action="store_true",
+                        help="Disable largest connected component filtering before UV unwrap")
     parser.add_argument("--keep_lcc", action="store_true",
                         help="Keep only largest connected component. May remove thin structures.")
     args, cfg_cmd = parser.parse_known_args()
@@ -82,23 +113,96 @@ def main():
     else:
         bounds = np.array([[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]])
 
+    if args.bounds_scale != 1.0:
+        if args.bounds_scale <= 0:
+            raise ValueError("bounds_scale must be > 0")
+        center = bounds.mean(axis=1)
+        half = (bounds[:, 1] - bounds[:, 0]) * 0.5 * args.bounds_scale
+        bounds = np.stack([center - half, center + half], axis=1)
+        print(f"Scaled bounds by {args.bounds_scale}: {bounds.tolist()}")
+    sphere_center = np.array(meta["sphere_center"], dtype=np.float32)
+    sphere_radius = float(meta["sphere_radius"])
+
+    mesh = None
+    if args.input_mesh:
+        if not os.path.isfile(args.input_mesh):
+            raise FileNotFoundError(f"Input mesh not found: {args.input_mesh}")
+        mesh_loaded = trimesh.load(args.input_mesh, process=False)
+        if isinstance(mesh_loaded, trimesh.Scene):
+            if not mesh_loaded.geometry:
+                raise ValueError(f"Input mesh scene is empty: {args.input_mesh}")
+            mesh = trimesh.util.concatenate(tuple(mesh_loaded.geometry.values()))
+        else:
+            mesh = mesh_loaded
+        if args.input_mesh_space == "world":
+            mesh.vertices = (mesh.vertices - sphere_center) / sphere_radius
+        print(f"Loaded input mesh: {args.input_mesh}")
+
     sdf_func = lambda x: -trainer.model_module.neural_sdf.sdf(x)  # noqa: E731
-    texture_func = partial(extract_texture, neural_sdf=trainer.model_module.neural_sdf,
-                           neural_rgb=trainer.model_module.neural_rgb,
-                           appear_embed=trainer.model_module.appear_embed) if args.textured else None
-    mesh = extract_mesh(sdf_func=sdf_func, bounds=bounds, intv=(2.0 / args.resolution),
-                        block_res=args.block_res, texture_func=texture_func, filter_lcc=args.keep_lcc)
+    texture_func = None
+    if args.textured and not args.uv_textured and not args.simplify_only and not args.input_mesh:
+        texture_func = partial(extract_texture, neural_sdf=trainer.model_module.neural_sdf,
+                               neural_rgb=trainer.model_module.neural_rgb,
+                               appear_embed=trainer.model_module.appear_embed)
+    if mesh is None:
+        mesh = extract_mesh(sdf_func=sdf_func, bounds=bounds, intv=(2.0 / args.resolution),
+                            block_res=args.block_res, texture_func=texture_func, filter_lcc=args.keep_lcc)
 
     if is_master():
+        if args.simplify_only:
+            if args.uv_textured:
+                print("Simplify-only mode enabled; skipping UV bake.")
+            if args.skip_uv_preprocess:
+                print("Simplify-only mode: skipping UV preprocess.")
+            else:
+                mesh = prepare_mesh_for_uv(
+                    mesh,
+                    target_faces=args.uv_target_faces,
+                    max_faces=args.uv_max_faces,
+                    keep_lcc=not args.uv_no_lcc,
+                    remesh=args.uv_remesh,
+                    remesh_target_len=args.uv_remesh_target_len,
+                    remesh_iters=args.uv_remesh_iters,
+                    remesh_position=args.uv_remesh_position,
+                )
+        elif args.uv_textured:
+            mesh = bake_uv_texture(
+                mesh,
+                neural_rgb=trainer.model_module.neural_rgb,
+                neural_sdf=trainer.model_module.neural_sdf,
+                appear_embed=trainer.model_module.appear_embed,
+                texture_size=args.texture_size,
+                batch_size=args.bake_batch,
+                target_faces=args.uv_target_faces,
+                max_faces=args.uv_max_faces,
+                keep_lcc=not args.uv_no_lcc,
+                raster_mode=args.uv_raster,
+                preprocess=not args.skip_uv_preprocess,
+                remesh=args.uv_remesh,
+                remesh_target_len=args.uv_remesh_target_len,
+                remesh_iters=args.uv_remesh_iters,
+                remesh_position=args.uv_remesh_position,
+            )
         print(f"vertices: {len(mesh.vertices)}")
         print(f"faces: {len(mesh.faces)}")
-        if args.textured:
+        if args.textured and not args.uv_textured and not args.simplify_only and not args.input_mesh:
             print(f"colors: {len(mesh.visual.vertex_colors)}")
+        if args.textured and args.uv_textured and not args.simplify_only:
+            print("Both --textured and --uv_textured are set. Using UV texture output.")
         # center and scale
-        mesh.vertices = mesh.vertices * meta["sphere_radius"] + np.array(meta["sphere_center"])
+        mesh.vertices = mesh.vertices * sphere_radius + sphere_center
         mesh.update_faces(mesh.nondegenerate_faces())
-        os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
-        mesh.export(args.output_file)
+        output_file = args.output_file
+        if args.uv_textured and not args.simplify_only:
+            ext = os.path.splitext(output_file)[1].lower()
+            if ext in {".ply", ".stl", ".off", ".obj"}:
+                if ext != ".obj":
+                    output_file = os.path.splitext(output_file)[0] + ".obj"
+                    print(f"UV textures require OBJ or GLB output. Writing to {output_file}")
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        mesh.export(output_file)
 
 
 if __name__ == "__main__":
