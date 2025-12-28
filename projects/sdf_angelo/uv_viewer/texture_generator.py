@@ -11,6 +11,7 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 '''
 
 import base64
+import queue
 import threading
 import time
 from io import BytesIO
@@ -24,7 +25,9 @@ from PIL import Image
 class TextureGenerator:
 
     def __init__(self, uv_cache, neural_rgb, appear_embed, sphere_center, sphere_radius,
-                 update_fps=1.0, batch_size=65536, appear_idx=None):
+                 update_fps=1.0, batch_size=65536, appear_idx=None,
+                 encode_base64=True, include_raw=False, async_encode=True,
+                 encode_queue_size=1):
         self.uv_cache = uv_cache
         self.neural_rgb = neural_rgb
         self.appear_embed = appear_embed
@@ -37,21 +40,32 @@ class TextureGenerator:
         self.batch_size = int(batch_size)
         update_fps = float(update_fps)
         self.update_interval = 0.0 if update_fps < 0 else 1.0 / max(update_fps, 1e-6)
+        self.encode_base64 = bool(encode_base64)
+        self.include_raw = bool(include_raw)
+        if not self.encode_base64 and not self.include_raw:
+            raise ValueError("At least one of encode_base64/include_raw must be True.")
+        self.async_encode = bool(async_encode)
+        self.encode_queue_size = max(int(encode_queue_size), 1)
         self.appear_idx = appear_idx
         self._app_value = self._init_app_value()
 
         self._lock = threading.Lock()
         self._texture_b64 = None
+        self._texture_bytes = None
         self._texture_ready = threading.Event()
         self._stop = threading.Event()
         self._camera_lock = threading.Lock()
         self._camera_pos_world = None
         self._thread = None
+        self._encode_thread = None
+        self._encode_queue = queue.Queue(maxsize=self.encode_queue_size) if self.async_encode else None
         self._stats_lock = threading.Lock()
         self._update_count = 0
         self._last_update_time = None
         self._last_update_fps = 0.0
         self._last_render_ms = 0.0
+        self._last_encode_ms = 0.0
+        self._last_total_ms = 0.0
 
     def _init_app_value(self):
         if self.appear_embed is None:
@@ -68,11 +82,16 @@ class TextureGenerator:
             return
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        if self.async_encode and self._encode_thread is None:
+            self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
+            self._encode_thread.start()
 
     def stop(self):
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+        if self._encode_thread is not None:
+            self._encode_thread.join(timeout=1.0)
 
     def update_camera(self, cam_pos_world):
         with self._camera_lock:
@@ -84,12 +103,20 @@ class TextureGenerator:
         with self._lock:
             return self._texture_b64
 
+    def get_texture_bytes(self):
+        if not self._texture_ready.wait(timeout=0.1):
+            return None
+        with self._lock:
+            return self._texture_bytes
+
     def get_stats(self):
         with self._stats_lock:
             return {
                 "updates": self._update_count,
                 "update_fps": self._last_update_fps,
-                "last_ms": self._last_render_ms,
+                "render_ms": self._last_render_ms,
+                "encode_ms": self._last_encode_ms,
+                "total_ms": self._last_total_ms,
             }
 
     def _get_camera(self):
@@ -114,23 +141,70 @@ class TextureGenerator:
             render_start = time.time()
             texture = self._render_texture(cam_pos)
             render_ms = (time.time() - render_start) * 1000.0
-            tex_b64 = _encode_texture_b64(texture)
-            now = time.time()
-            with self._stats_lock:
-                self._update_count += 1
-                if self._last_update_time is not None:
-                    dt = max(now - self._last_update_time, 1e-6)
-                    inst_fps = 1.0 / dt
-                    if self._last_update_fps == 0.0:
-                        self._last_update_fps = inst_fps
-                    else:
-                        self._last_update_fps = 0.8 * self._last_update_fps + 0.2 * inst_fps
-                self._last_update_time = now
-                self._last_render_ms = render_ms
-            with self._lock:
-                self._texture_b64 = tex_b64
-                self._texture_ready.set()
+            if self.async_encode:
+                self._enqueue_texture(texture, render_ms)
+            else:
+                self._encode_and_store(texture, render_ms)
             next_time = time.time() + self.update_interval
+
+    def _enqueue_texture(self, texture, render_ms):
+        if self._encode_queue is None:
+            return
+        try:
+            self._encode_queue.put_nowait((texture, render_ms))
+        except queue.Full:
+            try:
+                _ = self._encode_queue.get_nowait()
+                self._encode_queue.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self._encode_queue.put_nowait((texture, render_ms))
+            except queue.Full:
+                pass
+
+    def _encode_loop(self):
+        if self._encode_queue is None:
+            return
+        while not self._stop.is_set() or not self._encode_queue.empty():
+            try:
+                texture, render_ms = self._encode_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            self._encode_and_store(texture, render_ms)
+            self._encode_queue.task_done()
+
+    def _encode_and_store(self, texture, render_ms):
+        encode_ms = 0.0
+        tex_b64 = None
+        tex_bytes = None
+        if self.include_raw:
+            pack_start = time.time()
+            tex_bytes = _pack_texture_rgba(texture)
+            encode_ms += (time.time() - pack_start) * 1000.0
+        if self.encode_base64:
+            encode_start = time.time()
+            tex_b64 = _encode_texture_b64(texture)
+            encode_ms += (time.time() - encode_start) * 1000.0
+        total_ms = render_ms + encode_ms
+        now = time.time()
+        with self._stats_lock:
+            self._update_count += 1
+            if self._last_update_time is not None:
+                dt = max(now - self._last_update_time, 1e-6)
+                inst_fps = 1.0 / dt
+                if self._last_update_fps == 0.0:
+                    self._last_update_fps = inst_fps
+                else:
+                    self._last_update_fps = 0.8 * self._last_update_fps + 0.2 * inst_fps
+            self._last_update_time = now
+            self._last_render_ms = render_ms
+            self._last_encode_ms = encode_ms
+            self._last_total_ms = total_ms
+        with self._lock:
+            self._texture_b64 = tex_b64
+            self._texture_bytes = tex_bytes
+            self._texture_ready.set()
 
     def _render_texture(self, cam_pos_world):
         device = self.uv_cache.device
@@ -177,3 +251,15 @@ def _encode_texture_b64(texture):
     image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def _pack_texture_rgba(texture):
+    if not isinstance(texture, np.ndarray):
+        raise ValueError("Texture must be a numpy array.")
+    if texture.ndim != 3 or texture.shape[2] != 3:
+        raise ValueError("Texture must have shape [H,W,3].")
+    height, width, _ = texture.shape
+    rgba = np.empty((height, width, 4), dtype=np.uint8)
+    rgba[..., :3] = texture
+    rgba[..., 3] = 255
+    return rgba.tobytes()

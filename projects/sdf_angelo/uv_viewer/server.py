@@ -41,22 +41,31 @@ def parse_args():
     parser.add_argument("--batch_size", default=65536, type=int, help="Batch size for SDF/RGB queries.")
     parser.add_argument("--uv_raster", choices=["gpu", "cpu"], default="gpu",
                         help="Rasterization backend for UV cache.")
+    parser.add_argument("--texture_transport", choices=["png", "raw_rgba"], default="png",
+                        help="Texture transport format for the browser.")
+    parser.add_argument("--async_encode", dest="async_encode", action="store_true",
+                        help="Enable async encoding (default).")
+    parser.add_argument("--no_async_encode", dest="async_encode", action="store_false",
+                        help="Disable async encoding.")
     parser.add_argument("--appear_idx", default=None, type=int,
                         help="Optional appear_embed index. Omit to use zero embedding.")
     parser.add_argument("--host", default="0.0.0.0", type=str, help="Server host bind.")
     parser.add_argument("--port", default=8080, type=int, help="Server port.")
     parser.add_argument('--local_rank', type=int, default=os.getenv('LOCAL_RANK', 0))
     parser.add_argument('--single_gpu', action='store_true')
+    parser.set_defaults(async_encode=True)
     args, cfg_cmd = parser.parse_known_args()
     return args, cfg_cmd
 
 
 class APIContext:
 
-    def __init__(self, generator, mesh_obj, update_ms):
+    def __init__(self, generator, mesh_obj, update_ms, texture_size, texture_transport):
         self.generator = generator
         self.mesh_obj = mesh_obj
         self.update_ms = update_ms
+        self.texture_size = texture_size
+        self.texture_transport = texture_transport
 
 
 class ViewerHandler(SimpleHTTPRequestHandler):
@@ -70,6 +79,11 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header(
+            "Access-Control-Expose-Headers",
+            "X-Update-Fps, X-Render-Ms, X-Encode-Ms, X-Total-Ms, "
+            "X-GPU-Allocated-MB, X-GPU-Reserved-MB, X-GPU-Max-Allocated-MB",
+        )
         super().end_headers()
 
     def do_OPTIONS(self):
@@ -83,6 +97,8 @@ class ViewerHandler(SimpleHTTPRequestHandler):
             self._send_json({
                 "mesh_obj": self.api_context.mesh_obj,
                 "update_ms": int(self.api_context.update_ms),
+                "texture_size": int(self.api_context.texture_size),
+                "texture_transport": self.api_context.texture_transport,
             })
             return
         if self.path.startswith("/api/texture"):
@@ -90,6 +106,25 @@ class ViewerHandler(SimpleHTTPRequestHandler):
             stats = self.api_context.generator.get_stats()
             stats.update(_get_cuda_stats())
             self._send_json({"data_url": texture, "stats": stats})
+            return
+        if self.path.startswith("/api/texture_raw"):
+            if self.api_context.texture_transport != "raw_rgba":
+                self.send_response(404)
+                self.end_headers()
+                return
+            texture = self.api_context.generator.get_texture_bytes()
+            if texture is None:
+                self.send_response(204)
+                self.end_headers()
+                return
+            stats = self.api_context.generator.get_stats()
+            stats.update(_get_cuda_stats())
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(texture)))
+            _write_stats_headers(self, stats)
+            self.end_headers()
+            self.wfile.write(texture)
             return
         return super().do_GET()
 
@@ -157,6 +192,22 @@ def _get_cuda_stats():
     }
 
 
+def _write_stats_headers(handler, stats):
+    def _maybe(key, header):
+        value = stats.get(key)
+        if value is None:
+            return
+        handler.send_header(header, f"{value}")
+
+    _maybe("update_fps", "X-Update-Fps")
+    _maybe("render_ms", "X-Render-Ms")
+    _maybe("encode_ms", "X-Encode-Ms")
+    _maybe("total_ms", "X-Total-Ms")
+    _maybe("gpu_allocated_mb", "X-GPU-Allocated-MB")
+    _maybe("gpu_reserved_mb", "X-GPU-Reserved-MB")
+    _maybe("gpu_max_allocated_mb", "X-GPU-Max-Allocated-MB")
+
+
 def main():
     args, cfg_cmd = parse_args()
     set_affinity(args.local_rank)
@@ -206,6 +257,7 @@ def main():
         batch_size=args.batch_size,
     )
 
+    use_raw = args.texture_transport == "raw_rgba"
     generator = TextureGenerator(
         uv_cache=uv_cache,
         neural_rgb=trainer.model_module.neural_rgb,
@@ -215,6 +267,9 @@ def main():
         update_fps=args.update_fps,
         batch_size=args.batch_size,
         appear_idx=args.appear_idx,
+        encode_base64=not use_raw,
+        include_raw=use_raw,
+        async_encode=args.async_encode,
     )
 
     cam_pos = _initial_camera(mesh)
@@ -226,7 +281,13 @@ def main():
         mesh_obj = mesh_obj.decode("utf-8", errors="ignore")
 
     update_ms = 0 if args.update_fps < 0 else 1000.0 / max(args.update_fps, 1e-6)
-    api = APIContext(generator, mesh_obj, update_ms)
+    api = APIContext(
+        generator,
+        mesh_obj,
+        update_ms,
+        texture_size=uv_cache.tex_size,
+        texture_transport=args.texture_transport,
+    )
 
     static_dir = os.path.join(os.path.dirname(__file__), "web")
     ViewerHandler.api_context = api

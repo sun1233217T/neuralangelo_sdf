@@ -13,6 +13,8 @@ let renderFrames = 0;
 let renderFps = 0;
 let lastRenderTime = performance.now();
 let lastStats = null;
+let textureTransport = "png";
+let textureSize = 1024;
 
 const statusEl = document.getElementById("status");
 const viewerEl = document.getElementById("viewer");
@@ -26,6 +28,8 @@ const controls = {
   up: null,
   dragging: false,
   dragStart: null,
+  pointers: new Map(),
+  lastPinchDist: null,
 };
 
 function setStatus(text) {
@@ -48,13 +52,20 @@ function updateStatus(note) {
   }
   const invertLabel = controls.invert ? " (invert)" : "";
   lines.push(`Mode: ${controls.mode}${invertLabel}`);
+  lines.push(`Transport: ${textureTransport}`);
   lines.push(`Render FPS: ${formatNumber(renderFps, 1)}`);
   if (lastStats) {
     if (lastStats.update_fps !== undefined) {
-      lines.push(`Texture FPS: ${formatNumber(lastStats.update_fps, 2)}`);
+      lines.push(`Update FPS: ${formatNumber(lastStats.update_fps, 2)}`);
     }
-    if (lastStats.last_ms !== undefined) {
-      lines.push(`Texture ms: ${formatNumber(lastStats.last_ms, 1)}`);
+    if (lastStats.render_ms !== undefined) {
+      lines.push(`Render ms: ${formatNumber(lastStats.render_ms, 1)}`);
+    }
+    if (lastStats.encode_ms !== undefined) {
+      lines.push(`Encode ms: ${formatNumber(lastStats.encode_ms, 1)}`);
+    }
+    if (lastStats.total_ms !== undefined) {
+      lines.push(`Total ms: ${formatNumber(lastStats.total_ms, 1)}`);
     }
     if (lastStats.gpu_allocated_mb !== undefined) {
       const alloc = formatNumber(lastStats.gpu_allocated_mb, 0);
@@ -74,6 +85,7 @@ function createApi() {
       getInit: () => api.get_init(),
       getTexture: () => api.get_texture(),
       setCamera: (camera) => api.set_camera(camera),
+      getTextureRaw: null,
     };
   }
   return {
@@ -86,6 +98,15 @@ function createApi() {
       const res = await fetch("/api/texture");
       return res.json();
     },
+    getTextureRaw: async () => {
+      const res = await fetch("/api/texture_raw");
+      if (!res.ok || res.status === 204) {
+        return null;
+      }
+      const buffer = await res.arrayBuffer();
+      const stats = parseStatsFromHeaders(res.headers);
+      return { buffer, stats };
+    },
     setCamera: async (camera) => {
       await fetch("/api/camera", {
         method: "POST",
@@ -94,6 +115,39 @@ function createApi() {
       });
     },
   };
+}
+
+function parseStatsFromHeaders(headers) {
+  const stats = {};
+  const updateFps = parseFloat(headers.get("X-Update-Fps"));
+  if (!Number.isNaN(updateFps)) {
+    stats.update_fps = updateFps;
+  }
+  const renderMs = parseFloat(headers.get("X-Render-Ms"));
+  if (!Number.isNaN(renderMs)) {
+    stats.render_ms = renderMs;
+  }
+  const encodeMs = parseFloat(headers.get("X-Encode-Ms"));
+  if (!Number.isNaN(encodeMs)) {
+    stats.encode_ms = encodeMs;
+  }
+  const totalMs = parseFloat(headers.get("X-Total-Ms"));
+  if (!Number.isNaN(totalMs)) {
+    stats.total_ms = totalMs;
+  }
+  const gpuAlloc = parseFloat(headers.get("X-GPU-Allocated-MB"));
+  if (!Number.isNaN(gpuAlloc)) {
+    stats.gpu_allocated_mb = gpuAlloc;
+  }
+  const gpuReserved = parseFloat(headers.get("X-GPU-Reserved-MB"));
+  if (!Number.isNaN(gpuReserved)) {
+    stats.gpu_reserved_mb = gpuReserved;
+  }
+  const gpuMax = parseFloat(headers.get("X-GPU-Max-Allocated-MB"));
+  if (!Number.isNaN(gpuMax)) {
+    stats.gpu_max_allocated_mb = gpuMax;
+  }
+  return stats;
 }
 
 function parseOBJ(text) {
@@ -224,6 +278,7 @@ function initRenderer() {
   if (renderer.outputColorSpace !== undefined && THREE.SRGBColorSpace) {
     renderer.outputColorSpace = THREE.SRGBColorSpace;
   }
+  renderer.domElement.style.touchAction = "none";
   viewerEl.appendChild(renderer.domElement);
 }
 
@@ -238,10 +293,7 @@ function initScene(geometry) {
     1000
   );
 
-  texture = new THREE.Texture();
-  if (texture.colorSpace !== undefined && THREE.SRGBColorSpace) {
-    texture.colorSpace = THREE.SRGBColorSpace;
-  }
+  texture = createTexture();
   const material = new THREE.MeshBasicMaterial({
     map: texture,
     side: THREE.DoubleSide,
@@ -267,6 +319,33 @@ function initScene(geometry) {
   const z = controls.radius * Math.sin(phi) * Math.cos(theta);
   controls.offset.set(x, y, z);
   updateCameraFromOffset();
+}
+
+function createTexture() {
+  if (textureTransport === "raw_rgba") {
+    const data = new Uint8Array(textureSize * textureSize * 4);
+    const tex = new THREE.DataTexture(
+      data,
+      textureSize,
+      textureSize,
+      THREE.RGBAFormat,
+      THREE.UnsignedByteType
+    );
+    tex.flipY = true;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    if (tex.colorSpace !== undefined && THREE.SRGBColorSpace) {
+      tex.colorSpace = THREE.SRGBColorSpace;
+    }
+    tex.needsUpdate = true;
+    return tex;
+  }
+  const tex = new THREE.Texture();
+  if (tex.colorSpace !== undefined && THREE.SRGBColorSpace) {
+    tex.colorSpace = THREE.SRGBColorSpace;
+  }
+  return tex;
 }
 
 function updateCameraFromOffset() {
@@ -346,17 +425,49 @@ function trackballRotate(curr) {
 }
 
 function attachControls() {
-  viewerEl.addEventListener("mousedown", (event) => {
+  const canvas = renderer.domElement;
+  canvas.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    canvas.setPointerCapture(event.pointerId);
+    controls.pointers.set(event.pointerId, {
+      x: event.clientX,
+      y: event.clientY,
+      type: event.pointerType,
+    });
+    const touchPointers = getTouchPointers();
+    if (event.pointerType === "touch" && touchPointers.length === 2) {
+      controls.dragging = false;
+      controls.dragStart = null;
+      controls.lastPinchDist = pinchDistance(touchPointers[0], touchPointers[1]);
+      return;
+    }
     controls.dragging = true;
     if (controls.mode === "trackball") {
       controls.dragStart = projectOnTrackball(event.clientX, event.clientY);
     }
   });
-  window.addEventListener("mouseup", () => {
-    controls.dragging = false;
-    controls.dragStart = null;
-  });
-  window.addEventListener("mousemove", (event) => {
+  canvas.addEventListener("pointermove", (event) => {
+    if (!controls.pointers.has(event.pointerId)) {
+      return;
+    }
+    controls.pointers.set(event.pointerId, {
+      x: event.clientX,
+      y: event.clientY,
+      type: event.pointerType,
+    });
+    if (event.pointerType === "touch") {
+      const touchPointers = getTouchPointers();
+      if (touchPointers.length === 2) {
+        const dist = pinchDistance(touchPointers[0], touchPointers[1]);
+        if (controls.lastPinchDist && controls.offset) {
+          const scale = controls.lastPinchDist / dist;
+          controls.offset.multiplyScalar(scale);
+          updateCameraFromOffset();
+        }
+        controls.lastPinchDist = dist;
+        return;
+      }
+    }
     if (!controls.dragging) {
       return;
     }
@@ -365,6 +476,32 @@ function attachControls() {
       trackballRotate(curr);
     }
   });
+  canvas.addEventListener("pointerup", (event) => {
+    if (controls.pointers.has(event.pointerId)) {
+      controls.pointers.delete(event.pointerId);
+    }
+    const touchPointers = getTouchPointers();
+    if (touchPointers.length < 2) {
+      controls.lastPinchDist = null;
+    }
+    if (touchPointers.length === 1) {
+      const t = touchPointers[0];
+      controls.dragging = true;
+      controls.dragStart = projectOnTrackball(t.x, t.y);
+    } else {
+      controls.dragging = false;
+      controls.dragStart = null;
+    }
+  });
+  canvas.addEventListener("pointercancel", (event) => {
+    if (controls.pointers.has(event.pointerId)) {
+      controls.pointers.delete(event.pointerId);
+    }
+    controls.dragging = false;
+    controls.dragStart = null;
+    controls.lastPinchDist = null;
+  });
+
   viewerEl.addEventListener("wheel", (event) => {
     event.preventDefault();
     const delta = Math.sign(event.deltaY);
@@ -409,6 +546,22 @@ function attachControls() {
       updateCameraFromOffset();
     }
   });
+}
+
+function getTouchPointers() {
+  const touches = [];
+  for (const value of controls.pointers.values()) {
+    if (value.type === "touch") {
+      touches.push(value);
+    }
+  }
+  return touches;
+}
+
+function pinchDistance(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
 }
 
 let lastCamSent = new THREE.Vector3();
@@ -456,25 +609,48 @@ async function pollTexture() {
   }
   texturePending = true;
   try {
-    const result = await api.getTexture();
-    let dataUrl = null;
-    if (typeof result === "string") {
-      dataUrl = result;
-    } else if (result && typeof result === "object") {
-      dataUrl = result.data_url || null;
-      if (result.stats) {
+    if (textureTransport === "raw_rgba" && api.getTextureRaw) {
+      const result = await api.getTextureRaw();
+      if (result && result.stats) {
         lastStats = result.stats;
       }
-    }
-    if (dataUrl) {
-      const img = new Image();
-      img.onload = () => {
-        texture.image = img;
-        texture.needsUpdate = true;
-        textureUpdates += 1;
-        updateStatus();
-      };
-      img.src = dataUrl;
+      if (result && result.buffer) {
+        const data = new Uint8Array(result.buffer);
+        const expected = textureSize * textureSize * 4;
+        if (data.length === expected && texture.image && texture.image.data) {
+          if (texture.image.data.length !== data.length) {
+            texture.image.data = data;
+          } else {
+            texture.image.data.set(data);
+          }
+          texture.needsUpdate = true;
+          textureUpdates += 1;
+          updateStatus();
+        } else if (data.length !== expected) {
+          updateStatus(`Raw size mismatch: ${data.length} vs ${expected}`);
+        }
+      }
+    } else {
+      const result = await api.getTexture();
+      let dataUrl = null;
+      if (typeof result === "string") {
+        dataUrl = result;
+      } else if (result && typeof result === "object") {
+        dataUrl = result.data_url || null;
+        if (result.stats) {
+          lastStats = result.stats;
+        }
+      }
+      if (dataUrl) {
+        const img = new Image();
+        img.onload = () => {
+          texture.image = img;
+          texture.needsUpdate = true;
+          textureUpdates += 1;
+          updateStatus();
+        };
+        img.src = dataUrl;
+      }
     }
   } catch (err) {
     updateStatus(`Texture error: ${err}`);
@@ -492,6 +668,8 @@ async function init() {
   setStatus("Loading mesh...");
   const initData = await api.getInit();
   updateMs = initData.update_ms || updateMs;
+  textureSize = initData.texture_size || textureSize;
+  textureTransport = initData.texture_transport || textureTransport;
 
   const meshData = parseOBJ(initData.mesh_obj);
   const geometry = buildGeometry(meshData);

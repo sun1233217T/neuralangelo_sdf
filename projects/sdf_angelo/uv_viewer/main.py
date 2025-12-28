@@ -43,10 +43,15 @@ def parse_args():
                         help="Rasterization backend for UV cache.")
     parser.add_argument("--appear_idx", default=None, type=int,
                         help="Optional appear_embed index. Omit to use zero embedding.")
+    parser.add_argument("--async_encode", dest="async_encode", action="store_true",
+                        help="Enable async encoding (default).")
+    parser.add_argument("--no_async_encode", dest="async_encode", action="store_false",
+                        help="Disable async encoding.")
     parser.add_argument("--window_width", default=1280, type=int, help="Viewer window width.")
     parser.add_argument("--window_height", default=720, type=int, help="Viewer window height.")
     parser.add_argument('--local_rank', type=int, default=os.getenv('LOCAL_RANK', 0))
     parser.add_argument('--single_gpu', action='store_true')
+    parser.set_defaults(async_encode=True)
     args, cfg_cmd = parser.parse_known_args()
     return args, cfg_cmd
 
@@ -62,6 +67,8 @@ class WebAPI:
         return {
             "mesh_obj": self.mesh_obj,
             "update_ms": int(self.update_ms),
+            "texture_size": int(self.generator.uv_cache.tex_size),
+            "texture_transport": "png",
         }
 
     def get_texture(self):
@@ -175,6 +182,9 @@ def main():
         update_fps=args.update_fps,
         batch_size=args.batch_size,
         appear_idx=args.appear_idx,
+        encode_base64=True,
+        include_raw=False,
+        async_encode=args.async_encode,
     )
 
     cam_pos = _initial_camera(mesh)

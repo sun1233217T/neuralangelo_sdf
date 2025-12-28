@@ -60,3 +60,8 @@ python projects/sdf_angelo/scripts/extract_mesh.py --single_gpu \
     --output_file=${OUTPUT_MESH} \
     --resolution=${RESOLUTION} \
     --block_res=${BLOCK_RES} --textured
+
+
+python projects/sdf_angelo/scripts/extract_mesh.py --single_gpu   --config=${CONFIG}   --checkpoint=${CHECKPOINT}   --input_mesh=cutted.obj   --input_mesh_space=world   --output_file=mesh_uv.obj   --uv_textured   --uv_raster=gpu   --texture_size=4096 --uv_target_faces=50000 --uv_remesh --uv_remesh_position=after
+
+python projects/sdf_angelo/uv_viewer/server.py   --config ${CONFIG}   --checkpoint ${CHECKPOINT}   --mesh mesh_uv.obj   --single_gpu   --host 0.0.0.0   --port 8080   --texture_size 1024   --update_fps 8 --batch_size 1310720
