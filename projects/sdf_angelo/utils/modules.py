@@ -19,7 +19,7 @@ from projects.sdf_angelo.utils.spherical_harmonics import get_spherical_harmonic
 from projects.sdf_angelo.utils.mlp import MLPforNeuralSDF
 from projects.sdf_angelo.utils.misc import get_activation
 from projects.nerf.utils import nerf_util
-
+from mtools import debug
 
 class NeuralSDF(torch.nn.Module):
 
@@ -210,6 +210,7 @@ class NeuralRGB(torch.nn.Module):
         view_enc = self.encode_view(rays_unit)  # [...,LD]
         input_list = [points_3D, view_enc, normals, feats]
         if app is not None:
+            app = app.expand(-1,-1,feats.shape[2],-1) 
             input_list.append(app)
         if self.cfg_rgb.mode == "no_view_dir":
             input_list.remove(view_enc)

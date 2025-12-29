@@ -37,9 +37,9 @@ python train.py --single_gpu \
 	--wandb  --wandb_name test\
 	--resume --checkpoint logs/test/base/epoch_00408_iteration_000020000_checkpoint.pt --sdf_bootstrap
 
-EXPERIMENT=dtu
+EXPERIMENT=mip
 GROUP=test
-NAME=sdf_train_speed2
+NAME=sdf_train_speed2_garden
 CONFIG=projects/sdf_angelo/configs/${EXPERIMENT}-win.yaml
 python train.py --single_gpu \
     --logdir=logs/${GROUP}/${NAME} \

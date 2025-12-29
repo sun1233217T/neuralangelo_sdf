@@ -35,3 +35,5 @@ termcolor
 tqdm
 trimesh
 wandb
+
+pywebview

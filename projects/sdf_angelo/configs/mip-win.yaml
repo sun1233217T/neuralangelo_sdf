@@ -1,0 +1,38 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+# -----------------------------------------------------------------------------
+
+_parent_: projects/sdf_angelo/configs/base.yaml
+
+model:
+    object:
+        sdf:
+            mlp:
+                out_bias: 1.0
+                inside_out: True   # True for Meetingroom.
+            encoding:
+                coarse2fine:
+                    init_active_level: 8
+    appear_embed:
+        enabled: True
+        dim: 8
+
+data:
+    type: projects.sdf_angelo.data
+    root: /home/sunny/data/mipnerf360/garden
+    num_images: 185  # The number of training images.
+    train:
+        image_size: [835,1500]
+        batch_size: 1
+        subset:
+    val:
+        image_size: [300,540]
+        batch_size: 1
+        subset: 1
+        max_viz_samples: 16

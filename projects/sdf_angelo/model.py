@@ -392,7 +392,7 @@ class Model(BaseModel):
         gradients_base, hessians_base = self.neural_sdf.compute_gradients(points_base, training=self.training, sdf=sdfs_base)
         normals_base = torch_F.normalize(gradients_base, dim=-1)  # [B,R,N,3]
         rgbs_base = self.neural_rgb.forward(points_base, normals_base, rays_unit_base, feats_base, app=app)  # [B,R,N,3]
-        surface = self._surface_from_samples(center, dists_base, sdfs_base, gradients_base, rgbs_base, ray_unit, app)
+        surface = self._surface_from_samples(center, dists_base, sdfs_base, gradients_base, rgbs_base, ray_unit, None)
         dists = dists_base
         sdfs = sdfs_base
         gradients = gradients_base
@@ -416,6 +416,9 @@ class Model(BaseModel):
                 gather_idx = surface_idx[..., None].expand(-1, -1, 1, 3)
                 surface = dict(surface)
                 surface["surface_rgb"] = rgbs.gather(dim=2, index=gather_idx).squeeze(2)
+                surface["surface_sdf"] = sdfs.gather(dim=2, index=gather_idx[..., 0].unsqueeze(-1)).squeeze(2)
+                surface["surface_normal"] = gradients.gather(dim=2, index=gather_idx).squeeze(2)
+
             
         # SDF volume rendering.
         alphas = self.compute_neus_alphas(ray_unit, sdfs, gradients, dists, dist_far=far[..., None],
@@ -481,32 +484,32 @@ class Model(BaseModel):
             sdf_refined = torch.where(hit_mask, sdf_low, sdf_refined)
         gather_idx = idx[..., None, None].expand(-1, -1, 1, 3)
         surface_rgb = rgbs.gather(dim=2, index=gather_idx).squeeze(2)
-        surface_sdf = sdf_refined
-        surface_normal = gradients.gather(dim=2, index=gather_idx).squeeze(2)
+        # surface_sdf = sdf_refined
+        # surface_normal = gradients.gather(dim=2, index=gather_idx).squeeze(2)
         if hit_mask.any():
-            pts_refined = center + ray_unit * t_vals[..., None]
-            pts_hit = pts_refined[hit_mask]
-            rays_hit = ray_unit[hit_mask]
-            if app is not None:
-                app_hit = app[..., 0, :][hit_mask]
-            else:
-                app_hit = None
-            sdfs_hit, feats_hit = self.neural_sdf.forward(pts_hit)
-            grads_hit, _ = self.neural_sdf.compute_gradients(pts_hit, training=self.training, sdf=sdfs_hit)
-            normals_hit = torch_F.normalize(grads_hit, dim=-1)
-            rgbs_hit = self.neural_rgb.forward(pts_hit, normals_hit, rays_hit, feats_hit, app=app_hit)
+            # pts_refined = center + ray_unit * t_vals[..., None]
+            # pts_hit = pts_refined[hit_mask]
+            # rays_hit = ray_unit[hit_mask]
+            # if app is not None:
+            #     app_hit = app[..., 0, :][hit_mask]
+            # else:
+            #     app_hit = None
+            # sdfs_hit, feats_hit = self.neural_sdf.forward(pts_hit)
+            # grads_hit, _ = self.neural_sdf.compute_gradients(pts_hit, training=self.training, sdf=sdfs_hit)
+            # normals_hit = torch_F.normalize(grads_hit, dim=-1)
+            # rgbs_hit = self.neural_rgb.forward(pts_hit, normals_hit, rays_hit, feats_hit, app=app_hit)
             surface_rgb = surface_rgb.clone()
-            surface_normal = surface_normal.clone()
-            surface_sdf = surface_sdf.clone()
-            surface_rgb[hit_mask] = rgbs_hit
-            surface_normal[hit_mask] = normals_hit
-            surface_sdf[hit_mask] = sdfs_hit.squeeze(-1)
+            # surface_normal = surface_normal.clone()
+            # surface_sdf = surface_sdf.clone()
+            # surface_rgb[hit_mask] = rgbs_hit
+            # surface_normal[hit_mask] = normals_hit
+            # surface_sdf[hit_mask] = sdfs_hit.squeeze(-1)
         surface_depth = t_vals[..., None] / ray_unit.norm(dim=-1, keepdim=True)
         return dict(
             hit_mask=hit_mask,
-            surface_rgb=surface_rgb,
-            surface_sdf=surface_sdf,
-            surface_normal=surface_normal,
+            # surface_rgb=surface_rgb,
+            # surface_sdf=surface_sdf,
+            # surface_normal=surface_normal,
             surface_depth=surface_depth,
             t_vals=t_vals,
         )
@@ -540,7 +543,7 @@ class Model(BaseModel):
             num_samples_all = self.cfg_render.num_samples.coarse + \
                 self.cfg_render.num_samples.fine * self.cfg_render.num_sample_hierarchy
             app = self.appear_embed(sample_idx)[:, None, None]  # [B,1,1,C]
-            app = app.expand(-1, num_rays, num_samples_all, -1)  # [B,R,N,C]
+            app = app.expand(-1, num_rays, 1, -1)  # [B,R,1,C]
             # Background appearance embedding.
             if self.with_background:
                 app_outside = self.appear_embed_outside(sample_idx)[:, None, None]  # [B,1,1,C]

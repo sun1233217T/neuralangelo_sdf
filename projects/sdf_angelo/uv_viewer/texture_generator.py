@@ -56,6 +56,8 @@ class TextureGenerator:
         self._stop = threading.Event()
         self._camera_lock = threading.Lock()
         self._camera_pos_world = None
+        self._camera_dirty = False
+        self._camera_event = threading.Event()
         self._thread = None
         self._encode_thread = None
         self._encode_queue = queue.Queue(maxsize=self.encode_queue_size) if self.async_encode else None
@@ -96,6 +98,8 @@ class TextureGenerator:
     def update_camera(self, cam_pos_world):
         with self._camera_lock:
             self._camera_pos_world = np.asarray(cam_pos_world, dtype=np.float32)
+            self._camera_dirty = True
+        self._camera_event.set()
 
     def get_texture_b64(self):
         if not self._texture_ready.wait(timeout=0.1):
@@ -128,16 +132,20 @@ class TextureGenerator:
     def _run(self):
         next_time = time.time()
         while not self._stop.is_set():
+            if not self._camera_event.wait(timeout=0.1):
+                continue
+            if self._stop.is_set():
+                break
             now = time.time()
             if self.update_interval > 0 and now < next_time:
                 time.sleep(next_time - now)
-            cam_pos = self._get_camera()
-            if cam_pos is None:
-                if self.update_interval > 0:
-                    next_time = time.time() + self.update_interval
-                else:
-                    time.sleep(0.02)
-                continue
+            with self._camera_lock:
+                if not self._camera_dirty or self._camera_pos_world is None:
+                    self._camera_event.clear()
+                    continue
+                cam_pos = self._camera_pos_world.copy()
+                self._camera_dirty = False
+            self._camera_event.clear()
             render_start = time.time()
             texture = self._render_texture(cam_pos)
             render_ms = (time.time() - render_start) * 1000.0
