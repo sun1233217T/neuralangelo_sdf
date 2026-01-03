@@ -35,6 +35,7 @@ checkpoints
 *.svg
 *.mtl
 *.obj
+.CMD
 
 # log folder
 logs/

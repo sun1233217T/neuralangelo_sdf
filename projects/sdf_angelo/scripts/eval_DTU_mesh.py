@@ -1,4 +1,5 @@
 # adapted from https://github.com/jzhangbs/DTUeval-python
+import os
 import numpy as np
 import open3d as o3d
 import sklearn.neighbors as skln
@@ -6,6 +7,44 @@ from tqdm import tqdm
 from scipy.io import loadmat
 import multiprocessing as mp
 import argparse
+
+def _resolve_scale_mat_path(dataset_dir, scan, scale_mat_path):
+    candidates = []
+    if scale_mat_path:
+        if os.path.isdir(scale_mat_path):
+            candidates.extend([
+                os.path.join(scale_mat_path, "cameras_sphere.npz"),
+                os.path.join(scale_mat_path, f"scan{scan}", "cameras_sphere.npz"),
+                os.path.join(scale_mat_path, f"scan{scan:03}", "cameras_sphere.npz"),
+            ])
+        else:
+            candidates.append(scale_mat_path)
+    else:
+        candidates.extend([
+            os.path.join(dataset_dir, "cameras_sphere.npz"),
+            os.path.join(dataset_dir, f"scan{scan}", "cameras_sphere.npz"),
+            os.path.join(dataset_dir, f"scan{scan:03}", "cameras_sphere.npz"),
+        ])
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "cameras_sphere.npz not found. Provide --scale_mat_path or set --dataset_dir "
+        "to the DTU root containing scan folders."
+    )
+
+def _load_scale_mat(scale_mat_path):
+    scale_data = np.load(scale_mat_path)
+    if "scale_mat_0" in scale_data:
+        scale_mat = scale_data["scale_mat_0"]
+    elif "scale_mat" in scale_data:
+        scale_mat = scale_data["scale_mat"]
+    else:
+        scale_keys = sorted([key for key in scale_data.keys() if key.startswith("scale_mat")])
+        if not scale_keys:
+            raise KeyError(f"scale_mat not found in {scale_mat_path}")
+        scale_mat = scale_data[scale_keys[0]]
+    return scale_mat.reshape(4, 4)
 
 def sample_single_tri(input_):
     n1, n2, v1, v2, tri_vert = input_
@@ -34,8 +73,14 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_dir', type=str, default='.')
     parser.add_argument('--vis_out_dir', type=str, default='.')
     parser.add_argument('--downsample_density', type=float, default=0.2)
+    parser.add_argument('--downsample_method', type=str, default='radius',
+                        choices=['radius', 'voxel'])
+    parser.add_argument('--apply_scale_mat', action='store_true',
+                        help='Apply DTU scale_mat (normalized -> world) before evaluation')
+    parser.add_argument('--scale_mat_path', type=str, default='',
+                        help='Path to cameras_sphere.npz or DTU root/scan folder')
     parser.add_argument('--patch_size', type=float, default=60)
-    parser.add_argument('--max_dist', type=float, default=200000)
+    parser.add_argument('--max_dist', type=float, default=20)
     parser.add_argument('--visualize_threshold', type=float, default=10)
     args = parser.parse_args()
 
@@ -76,6 +121,12 @@ if __name__ == '__main__':
         data_pcd_o3d = o3d.io.read_point_cloud(args.data)
         data_pcd = np.asarray(data_pcd_o3d.points)
 
+    if args.apply_scale_mat:
+        scale_mat_path = _resolve_scale_mat_path(args.dataset_dir, args.scan, args.scale_mat_path)
+        scale_mat = _load_scale_mat(scale_mat_path)
+        data_pcd = data_pcd @ scale_mat[:3, :3].T + scale_mat[:3, 3]
+        print(f'apply scale_mat from: {scale_mat_path}')
+
     pbar.update(1)
     pbar.set_description('random shuffle pcd index')
     shuffle_rng = np.random.default_rng()
@@ -83,15 +134,20 @@ if __name__ == '__main__':
 
     pbar.update(1)
     pbar.set_description('downsample pcd')
-    nn_engine = skln.NearestNeighbors(n_neighbors=1, radius=thresh, algorithm='kd_tree', n_jobs=-1)
-    nn_engine.fit(data_pcd)
-    rnn_idxs = nn_engine.radius_neighbors(data_pcd, radius=thresh, return_distance=False)
-    mask = np.ones(data_pcd.shape[0], dtype=np.bool_)
-    for curr, idxs in enumerate(rnn_idxs):
-        if mask[curr]:
-            mask[idxs] = 0
-            mask[curr] = 1
-    data_down = data_pcd[mask]
+    if args.downsample_method == 'radius':
+        nn_engine = skln.NearestNeighbors(n_neighbors=1, radius=thresh, algorithm='kd_tree', n_jobs=-1)
+        nn_engine.fit(data_pcd)
+        rnn_idxs = nn_engine.radius_neighbors(data_pcd, radius=thresh, return_distance=False)
+        mask = np.ones(data_pcd.shape[0], dtype=np.bool_)
+        for curr, idxs in enumerate(rnn_idxs):
+            if mask[curr]:
+                mask[idxs] = 0
+                mask[curr] = 1
+        data_down = data_pcd[mask]
+    else:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(data_pcd)
+        data_down = np.asarray(pcd.voxel_down_sample(voxel_size=thresh).points)
 
     pbar.update(1)
     pbar.set_description('masking data pcd')
@@ -116,10 +172,16 @@ if __name__ == '__main__':
 
     pbar.update(1)
     pbar.set_description('compute data2stl')
-    nn_engine.fit(stl)
-    dist_d2s, idx_d2s = nn_engine.kneighbors(data_in_obs, n_neighbors=1, return_distance=True)
     max_dist = args.max_dist
-    mean_d2s = dist_d2s[dist_d2s < max_dist].mean()
+    if data_in_obs.shape[0] == 0 or stl.shape[0] == 0:
+        dist_d2s = np.empty((0, 1), dtype=np.float32)
+        mean_d2s = np.nan
+        print(f'warning: skip data2stl (data_in_obs={data_in_obs.shape[0]}, stl={stl.shape[0]})')
+    else:
+        nn_engine = skln.NearestNeighbors(n_neighbors=1, algorithm='kd_tree', n_jobs=-1)
+        nn_engine.fit(stl)
+        dist_d2s, idx_d2s = nn_engine.kneighbors(data_in_obs, n_neighbors=1, return_distance=True)
+        mean_d2s = dist_d2s[dist_d2s < max_dist].mean()
 
     pbar.update(1)
     pbar.set_description('compute stl2data')
@@ -129,9 +191,15 @@ if __name__ == '__main__':
     above = (ground_plane.reshape((1,4)) * stl_hom).sum(-1) > 0
     stl_above = stl[above]
 
-    nn_engine.fit(data_in)
-    dist_s2d, idx_s2d = nn_engine.kneighbors(stl_above, n_neighbors=1, return_distance=True)
-    mean_s2d = dist_s2d[dist_s2d < max_dist].mean()
+    if data_in.shape[0] == 0 or stl_above.shape[0] == 0:
+        dist_s2d = np.empty((0, 1), dtype=np.float32)
+        mean_s2d = np.nan
+        print(f'warning: skip stl2data (data_in={data_in.shape[0]}, stl_above={stl_above.shape[0]})')
+    else:
+        nn_engine = skln.NearestNeighbors(n_neighbors=1, algorithm='kd_tree', n_jobs=-1)
+        nn_engine.fit(data_in)
+        dist_s2d, idx_s2d = nn_engine.kneighbors(stl_above, n_neighbors=1, return_distance=True)
+        mean_s2d = dist_s2d[dist_s2d < max_dist].mean()
 
     pbar.update(1)
     pbar.set_description('visualize error')
@@ -141,14 +209,16 @@ if __name__ == '__main__':
     B = np.array([[0,0,1]], dtype=np.float64)
     W = np.array([[1,1,1]], dtype=np.float64)
     data_color = np.tile(B, (data_down.shape[0], 1))
-    data_alpha = dist_d2s.clip(max=vis_dist) / vis_dist
-    data_color[ np.where(inbound)[0][grid_inbound][in_obs] ] = R * data_alpha + W * (1-data_alpha)
-    data_color[ np.where(inbound)[0][grid_inbound][in_obs][dist_d2s[:,0] >= max_dist] ] = G
+    if dist_d2s.size:
+        data_alpha = dist_d2s.clip(max=vis_dist) / vis_dist
+        data_color[ np.where(inbound)[0][grid_inbound][in_obs] ] = R * data_alpha + W * (1-data_alpha)
+        data_color[ np.where(inbound)[0][grid_inbound][in_obs][dist_d2s[:,0] >= max_dist] ] = G
     write_vis_pcd(f'{args.vis_out_dir}/vis_{args.scan:03}_d2s.ply', data_down, data_color)
     stl_color = np.tile(B, (stl.shape[0], 1))
-    stl_alpha = dist_s2d.clip(max=vis_dist) / vis_dist
-    stl_color[ np.where(above)[0] ] = R * stl_alpha + W * (1-stl_alpha)
-    stl_color[ np.where(above)[0][dist_s2d[:,0] >= max_dist] ] = G
+    if dist_s2d.size:
+        stl_alpha = dist_s2d.clip(max=vis_dist) / vis_dist
+        stl_color[ np.where(above)[0] ] = R * stl_alpha + W * (1-stl_alpha)
+        stl_color[ np.where(above)[0][dist_s2d[:,0] >= max_dist] ] = G
     write_vis_pcd(f'{args.vis_out_dir}/vis_{args.scan:03}_s2d.ply', stl, stl_color)
 
     pbar.update(1)
