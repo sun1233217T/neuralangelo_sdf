@@ -14,8 +14,8 @@ model:
     object:
         sdf:
             mlp:
-                out_bias: 1.0
-                inside_out: True   # True for Meetingroom.
+                out_bias: 0.5       #0.5 for bicycle; 1.0 for garden
+                inside_out: False   # True for indoor-Room.
             encoding:
                 coarse2fine:
                     init_active_level: 8
@@ -25,8 +25,8 @@ model:
 
 data:
     type: projects.sdf_angelo.data
-    root: /home/haochen/data/mipnerf360/garden
-    num_images: 185  # The number of training images.
+    root: /home/haochen/data/mip360/bicycle
+    num_images: 194  # The number of training images.
     train:
         image_size: [835,1500]
         batch_size: 1

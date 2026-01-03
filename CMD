@@ -1,6 +1,6 @@
 EXPERIMENT=dtu
 GROUP=test
-NAME=test2
+NAME=test3
 CONFIG=projects/neuralangelo/configs/${EXPERIMENT}.yaml
 GPUS=1  # use >1 for multi-GPU training!
 CUDA_VISIBLE_DEVICES=0 torchrun --master_port=29503 --nproc_per_node=${GPUS} train.py \
@@ -46,7 +46,7 @@ python train.py --single_gpu \
     --config=${CONFIG} \
     --show_pbar \
 	--wandb  --wandb_name test\
-	--resume 
+	--resume --data.root /home/haochen/data/DTU/scan36
 
 CHECKPOINT=logs/${GROUP}/${NAME}/xxx.pt
 OUTPUT_MESH=meshout/test1.ply
