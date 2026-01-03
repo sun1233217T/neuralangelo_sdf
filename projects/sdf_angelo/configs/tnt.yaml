@@ -24,7 +24,7 @@ model:
 
 data:
     type: projects.sdf_angelo.data
-    root: datasets/tanks_and_temples/Barn
+    root: /home/haochen/data/tnt2/Barn
     num_images: 410  # The number of training images.
     train:
         image_size: [835,1500]

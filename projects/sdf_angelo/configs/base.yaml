@@ -15,7 +15,7 @@ max_iter: 500000  # derived from epochs in trainer
 
 wandb_scalar_iter: 100
 wandb_image_iter: 10000
-validation_iter: 1000
+validation_iter: 5000
 wandb_scalar_epoch: 4
 wandb_image_epoch: 400
 validation_epoch: 200
