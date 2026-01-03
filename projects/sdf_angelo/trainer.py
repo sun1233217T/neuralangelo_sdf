@@ -10,7 +10,11 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 -----------------------------------------------------------------------------
 '''
 
+import json
 import math
+import os
+
+import numpy as np
 import torch
 import torch.nn.functional as torch_F
 import wandb
@@ -19,6 +23,7 @@ from imaginaire.utils.distributed import master_only
 from imaginaire.utils.visualization import wandb_image
 from projects.nerf.trainers.base import BaseTrainer
 from projects.sdf_angelo.utils.misc import get_scheduler, eikonal_loss, curvature_loss, sdf_shift_loss
+from projects.sdf_angelo.scripts.read_write_model import read_points3D_binary, read_points3D_text
 
 from mtools import debug
 
@@ -33,12 +38,120 @@ class Trainer(BaseTrainer):
         if cfg.model.object.sdf.encoding.type == "hashgrid" and cfg.model.object.sdf.encoding.coarse2fine.enabled:
             self.c2f_step = cfg.model.object.sdf.encoding.coarse2fine.step
             self.model.module.neural_sdf.warm_up_end = self.warm_up_end
+        self._init_pointcloud_sdf(cfg)
 
     def _init_loss(self, cfg):
         self.criteria["render"] = torch.nn.L1Loss()
 
     def setup_scheduler(self, cfg, optim):
         return get_scheduler(cfg.optim, optim)
+
+    def _init_pointcloud_sdf(self, cfg):
+        pc_cfg = getattr(cfg.trainer, "pointcloud_sdf", None)
+        self.pc_sdf_enabled = bool(getattr(pc_cfg, "enabled", False)) if pc_cfg else False
+        self.pc_sdf_base_weight = float(getattr(cfg.trainer.loss_weight, "pc_sdf", 0.0))
+        self.pc_sdf_weight = 0.0
+        self.pc_sdf_points = None
+        self.pc_sdf_num_samples = 0
+        self.pc_sdf_warmup_iters = 0
+        self.pc_sdf_end_iter = 0
+        self.pc_sdf_loss_type = "huber"
+        self.pc_sdf_huber_delta = 0.1
+        self.pc_sdf_max_error = None
+        if not self.pc_sdf_enabled or self.pc_sdf_base_weight <= 0.0:
+            if "pc_sdf" in self.weights:
+                self.weights["pc_sdf"] = 0.0
+            return
+
+        self.pc_sdf_num_samples = int(getattr(pc_cfg, "num_samples", 10000))
+        self.pc_sdf_warmup_iters = int(getattr(pc_cfg, "warmup_iters", 0))
+        self.pc_sdf_end_iter = int(getattr(pc_cfg, "end_iter", 0))
+        self.pc_sdf_loss_type = str(getattr(pc_cfg, "loss_type", "huber")).lower()
+        self.pc_sdf_huber_delta = float(getattr(pc_cfg, "huber_delta", 0.1))
+        self.pc_sdf_max_error = getattr(pc_cfg, "max_error", None)
+        self.pc_sdf_points = self._load_pointcloud_sdf_points(cfg, pc_cfg)
+        if self.pc_sdf_points is None or self.pc_sdf_points.numel() == 0:
+            print("Point cloud SDF warmup disabled: no usable points loaded.")
+            self.pc_sdf_enabled = False
+            if "pc_sdf" in self.weights:
+                self.weights["pc_sdf"] = 0.0
+
+    def _load_pointcloud_sdf_points(self, cfg, pc_cfg):
+        data_root = cfg.data.root
+        pc_rel_path = getattr(pc_cfg, "path", "sparse/points3D.bin")
+        pc_path = os.path.join(data_root, pc_rel_path)
+        points3d = None
+        if os.path.isfile(pc_path):
+            points3d = read_points3D_binary(pc_path)
+        else:
+            alt_path = os.path.join(data_root, "sparse", "points3D.txt")
+            if os.path.isfile(alt_path):
+                points3d = read_points3D_text(alt_path)
+        if not points3d:
+            print(f"Point cloud file not found or empty: {pc_path}")
+            return None
+
+        xyzs = np.stack([pt.xyz for pt in points3d.values()], axis=0).astype(np.float32)
+        errors = np.array([float(pt.error) for pt in points3d.values()], dtype=np.float32)
+        if self.pc_sdf_max_error is not None:
+            max_error = float(self.pc_sdf_max_error)
+            if max_error > 0:
+                mask = errors <= max_error
+                xyzs = xyzs[mask]
+        if xyzs.size == 0:
+            print("Point cloud SDF warmup disabled: all points filtered by error.")
+            return None
+
+        center, radius = self._get_scene_normalization(cfg)
+        if radius <= 0:
+            print("Point cloud SDF warmup disabled: invalid sphere radius.")
+            return None
+        xyzs = (xyzs - center[None, :]) / radius
+        return torch.from_numpy(xyzs).float()
+
+    def _get_scene_normalization(self, cfg):
+        meta_path = os.path.join(cfg.data.root, "transforms.json")
+        center = np.zeros(3, dtype=np.float32)
+        radius = 1.0
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r") as file:
+                meta = json.load(file)
+            center = np.array(meta.get("sphere_center", [0.0, 0.0, 0.0]), dtype=np.float32)
+            radius = float(meta.get("sphere_radius", 1.0))
+        readjust = getattr(cfg.data, "readjust", None)
+        if readjust is not None:
+            center += np.array(getattr(readjust, "center", [0.0, 0.0, 0.0]), dtype=np.float32)
+            radius *= float(getattr(readjust, "scale", 1.0))
+        return center, radius
+
+    def _sample_pointcloud_sdf_points(self, device):
+        if self.pc_sdf_points is None or self.pc_sdf_points.numel() == 0:
+            return None
+        num_points = self.pc_sdf_points.shape[0]
+        if num_points == 0 or self.pc_sdf_num_samples <= 0:
+            return None
+        idx = torch.randint(0, num_points, (self.pc_sdf_num_samples,), device=self.pc_sdf_points.device)
+        pts = self.pc_sdf_points.index_select(0, idx)
+        return pts.to(device, non_blocking=True)
+
+    @staticmethod
+    def _huber_loss(values, delta):
+        abs_val = values.abs()
+        delta_t = abs_val.new_tensor(max(float(delta), 1e-6))
+        quadratic = torch.where(abs_val < delta_t, abs_val, delta_t)
+        linear = abs_val - quadratic
+        return 0.5 * (quadratic ** 2) / delta_t + linear
+
+    def _get_pc_sdf_weight(self, current_iteration):
+        if not self.pc_sdf_enabled:
+            return 0.0
+        if self.pc_sdf_end_iter > 0 and current_iteration >= self.pc_sdf_end_iter:
+            return 0.0
+        if self.pc_sdf_warmup_iters > 0:
+            warmup_ratio = min(float(current_iteration) / float(self.pc_sdf_warmup_iters), 1.0)
+        else:
+            warmup_ratio = 1.0
+        return self.pc_sdf_base_weight * warmup_ratio
 
     def _compute_loss(self, data, mode=None):
         if mode == "train":
@@ -54,11 +167,27 @@ class Trainer(BaseTrainer):
                 self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"], data["rgb_offsets"], data["image_sampled"], data["rgb"])
             if "sdf_render" in self.weights and "surface_rgb" in data:
                 self.losses["sdf_render"] = self.criteria["render"](data["surface_rgb"], data["image_sampled"])
+            self.losses.pop("pc_sdf", None)
+            self.pc_sdf_weight = self._get_pc_sdf_weight(self.current_iteration)
+            if "pc_sdf" in self.weights:
+                self.weights["pc_sdf"] = self.pc_sdf_weight
+            if self.pc_sdf_weight > 0:
+                pts = self._sample_pointcloud_sdf_points(data["rgb"].device)
+                if pts is not None:
+                    sdf = self.model_module.neural_sdf.sdf(pts).squeeze(-1)
+                    if self.pc_sdf_loss_type == "huber":
+                        self.losses["pc_sdf"] = self._huber_loss(sdf, self.pc_sdf_huber_delta).mean()
+                    else:
+                        self.losses["pc_sdf"] = sdf.abs().mean()
 
         else:
             # Compute loss on the entire image.
             self.losses["render"] = self.criteria["render"](data["rgb_map"], data["image"])
             self.metrics["psnr"] = -10 * torch_F.mse_loss(data["rgb_map"], data["image"]).log10()
+            self.pc_sdf_weight = 0.0
+            if "pc_sdf" in self.weights:
+                self.weights["pc_sdf"] = 0.0
+            self.losses.pop("pc_sdf", None)
         # for key in self.losses:
         #     print(f"{mode} loss {key}: {self.losses[key].item()} weight: {self.weights.get(key, 'N/A')}")
 
@@ -100,6 +229,8 @@ class Trainer(BaseTrainer):
             scalars[f"{mode}/epsilon"] = self.model.module.neural_sdf.normal_eps
         if self.cfg.model.object.sdf.encoding.coarse2fine.enabled:
             scalars[f"{mode}/active_levels"] = self.model.module.neural_sdf.active_levels
+        if mode == "train" and "pc_sdf" in self.weights:
+            scalars[f"{mode}/pc_sdf_weight"] = self.pc_sdf_weight
         wandb.log(scalars, step=self.current_iteration)
 
     @master_only

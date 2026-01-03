@@ -91,7 +91,7 @@ class Model(BaseModel):
     def _init_surface_refine(self, cfg_model):
         refine_cfg = getattr(cfg_model.object.sdf, "surface_refine", None)
         self.surface_refine_enabled = bool(getattr(refine_cfg, "enabled", False))
-        self.surface_refine_steps = getattr(refine_cfg, "steps", 4)
+        self.surface_refine_steps = getattr(refine_cfg, "steps", 8)
         self.surface_refine_eps = getattr(refine_cfg, "eps", 1e-4)
         samples_cfg = getattr(cfg_model.object.sdf, "surface_samples", None)
         self.surface_samples_enabled = bool(getattr(samples_cfg, "enabled", False))
@@ -393,6 +393,7 @@ class Model(BaseModel):
         normals_base = torch_F.normalize(gradients_base, dim=-1)  # [B,R,N,3]
         rgbs_base = self.neural_rgb.forward(points_base, normals_base, rays_unit_base, feats_base, app=app)  # [B,R,N,3]
         surface = self._surface_from_samples(center, dists_base, sdfs_base, gradients_base, rgbs_base, ray_unit, None)
+        # debug()
         dists = dists_base
         sdfs = sdfs_base
         gradients = gradients_base
