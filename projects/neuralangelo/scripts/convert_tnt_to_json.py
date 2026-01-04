@@ -172,6 +172,7 @@ def compute_bound(pts):
 def init_colmap(args):
     assert args.tnt_path, "Provide path to Tanks and Temples dataset"
     scene_list = os.listdir(args.tnt_path)
+    scene_list = ["Barn"]
 
     for scene in scene_list:
         scene_path = os.path.join(args.tnt_path, scene)
@@ -184,17 +185,15 @@ def init_colmap(args):
         os.system(f"colmap feature_extractor --database_path {scene_path}/database.db \
                 --image_path {scene_path}/images_raw \
                 --ImageReader.camera_model=RADIAL \
-                --SiftExtraction.use_gpu=true \
-                --SiftExtraction.num_threads=32 \
                 --ImageReader.single_camera=true"
                   )
-
+        print('Feature extraction done.')
         # match features
         os.system(f"colmap sequential_matcher \
                 --database_path {scene_path}/database.db \
-                --SiftMatching.use_gpu=true"
+                "
                   )
-
+        print('Feature matching done.')
         # read poses
         poses = load_COLMAP_poses(os.path.join(scene_path, f'{scene}_COLMAP_SfM.log'),
                                   os.path.join(scene_path, 'images_raw'))
@@ -206,7 +205,7 @@ def init_colmap(args):
         db_file = os.path.join(scene_path, 'database.db')
         sfm_dir = os.path.join(scene_path, 'sparse')
         create_init_files(pinhole_dict_file, db_file, sfm_dir)
-
+        print('COLMAP initial files created.')
         # bundle adjustment
         os.system(f"colmap point_triangulator \
                 --database_path {scene_path}/database.db \
@@ -215,12 +214,13 @@ def init_colmap(args):
                 --output_path {scene_path}/sparse \
                 --Mapper.tri_ignore_two_view_tracks=true"
                   )
+        print('Point triangulation done.')
         os.system(f"colmap bundle_adjuster \
                 --input_path {scene_path}/sparse \
                 --output_path {scene_path}/sparse \
                 --BundleAdjustment.refine_extrinsics=false"
                   )
-
+        print('Bundle adjustment done.')
         # undistortion
         os.system(f"colmap image_undistorter \
             --image_path {scene_path}/images_raw \
@@ -229,7 +229,7 @@ def init_colmap(args):
             --output_type COLMAP \
             --max_image_size 1500"
                   )
-
+        print('Image undistortion done.')
         # read for bounding information
         trans = load_transformation(os.path.join(scene_path, f'{scene}_trans.txt'))
         pts = trimesh.load(os.path.join(scene_path, f'{scene}.ply'))
