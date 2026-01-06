@@ -14,10 +14,11 @@ import torch
 import torch.nn.functional as torch_F
 import wandb
 
-from imaginaire.utils.distributed import master_only
+from imaginaire.utils.distributed import master_only, master_only_print
 from imaginaire.utils.visualization import wandb_image
 from projects.nerf.trainers.base import BaseTrainer
 from projects.sdf_GS_gengeration.utils.misc import get_scheduler, eikonal_loss, curvature_loss, sdf_shift_loss
+from projects.sdf_GS_gengeration.nueralsdf_pretrainer import SDF_GS_Trainer
 
 from mtools import debug
 
@@ -32,6 +33,8 @@ class Trainer(BaseTrainer):
         if cfg.model.object.sdf.encoding.type == "hashgrid" and cfg.model.object.sdf.encoding.coarse2fine.enabled:
             self.c2f_step = cfg.model.object.sdf.encoding.coarse2fine.step
             self.model.module.neural_sdf.warm_up_end = self.warm_up_end
+
+        self._gs_pretrain_done = False
 
     def _init_loss(self, cfg):
         self.criteria["render"] = torch.nn.L1Loss()
@@ -119,5 +122,18 @@ class Trainer(BaseTrainer):
         wandb.log(images, step=self.current_iteration)
 
     def train(self, cfg, data_loader, single_gpu=False, profile=False, show_pbar=False):
+        if not self._gs_pretrain_done:
+            self._maybe_run_gs_pretrain(cfg)
+            self._gs_pretrain_done = True
         self.progress = self.model_module.progress = self.current_iteration / self.cfg.max_iter
         super().train(cfg, data_loader, single_gpu, profile, show_pbar)
+
+    def _maybe_run_gs_pretrain(self, cfg):
+        pretrain_cfg = getattr(cfg, "GS_pretrainer", None)
+        if not pretrain_cfg or not getattr(pretrain_cfg, "enabled", False):
+            return
+        if getattr(self.checkpointer, "checkpoint_path", None) is not None:
+            master_only_print("Skip GS pretrainer: checkpoint already loaded.")
+            return
+        pretrainer = SDF_GS_Trainer(self.model_module, cfg)
+        pretrainer.run()

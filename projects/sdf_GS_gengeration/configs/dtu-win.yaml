@@ -11,10 +11,11 @@
 _parent_: projects/sdf_GS_gengeration/configs/base.yaml
 
 model:
+    # type: projects.sdf_GS_gengeration.mini_model
     object:
         sdf:
             mlp:
-                inside_out: False
+                inside_out: True
             encoding:
                 coarse2fine:
                     init_active_level: 4
@@ -22,6 +23,39 @@ model:
             init_val: 1.4
     appear_embed:
         enabled: False
+
+GS_pretrainer:
+    enabled: True
+    gaussian_path: /home/sunny/project/neuralangelo_sdf/GS_models/scan24/log_full_test_r2/point_cloud/iteration_30000/point_cloud.ply
+    data_root: /home/sunny/data/DTU/scan24
+    normalize: True
+    normalize_mode: camera_align
+    gs_cameras_path: /home/sunny/project/neuralangelo_sdf/GS_models/scan24/log_full_test_r2/cameras.json
+    apply_gl_to_cv: False
+    force_full_levels: False
+    dump_points_path: gs_pretrain_points.ply
+    dump_points_num: 0
+    num_iters: 50000
+    batch_size: 10000
+    radius_std: 0.1
+    sdf_mode: ellipsoid
+    loss_type: l1
+    eikonal_weight: 0.05
+    opacity_thresh: 0.05
+    max_gaussians: 0
+    input_pts: /home/sunny/project/neuralangelo_sdf/GS_models/scan24/log_full_test_r2/point_cloud/iteration_30000/point_cloud.pts
+    sample_std: 0.05
+    N_samples: 1
+    clamping_distance: 0.1
+    max_points: 0
+    log_interval: 100
+    optim:
+        type: AdamW
+        params:
+            lr: 1.0e-3
+            weight_decay: 1e-2
+        sched:
+            type: constant
 
 data:
     type: projects.sdf_GS_gengeration.data

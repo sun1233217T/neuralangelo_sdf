@@ -39,6 +39,7 @@ checkpoints
 
 # log folder
 logs/
+GS_models/
 
 # dataset folder
 datasets/

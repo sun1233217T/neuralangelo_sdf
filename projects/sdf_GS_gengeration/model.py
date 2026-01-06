@@ -206,6 +206,7 @@ class Model(BaseModel):
         outside = dist_near.isnan()
         dist_near[outside], dist_far[outside] = 1, 1.2  # Dummy distances. Density will be set to 0.
         return dist_near, dist_far, outside
+    
     @torch.no_grad()
     def det_surface(self, center, ray_unit, near, far, max_steps=128, eps=1e-4, step_scale=0.9, refine_steps=3):
         """Sphere tracing to find the first SDF zero crossing along rays, with optional bisection refinement on sign flips.
@@ -283,4 +284,5 @@ class Model(BaseModel):
             # Cache previous values for refinement.
             prev_t = t_vals.clone()
             prev_sdf = sdfs.clone()
+        debug()
         return surface_points, hit_mask, t_vals

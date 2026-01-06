@@ -40,6 +40,44 @@ trainer:
         enabled: False
     depth_vis_scale: 0.5
 
+GS_pretrainer:
+    enabled: False
+    gaussian_path: null
+    data_root: null
+    normalize: True
+    normalize_mode: dataset
+    gs_cameras_path: null
+    align_allow_reflection: False
+    camera_align_use_dataset_norm: True
+    num_iters: 0
+    batch_size: 65536
+    radius_std: 0.0
+    sdf_mode: zero
+    loss_type: l1
+    huber_delta: 0.1
+    opacity_thresh: 0.0
+    max_gaussians: 0
+    input_pts: null
+    sample_std: 0.05
+    N_samples: 1
+    clamping_distance: 0.0
+    max_points: 0
+    eikonal_weight: 0.0
+    log_interval: 100
+    log_wandb: False
+    wandb_step_offset: 0
+    force_full_levels: False
+    apply_gl_to_cv: True
+    dump_points_path: null
+    dump_points_num: 0
+    optim:
+        type: Adam
+        params:
+            lr: 1e-3
+            weight_decay: 0.0
+        sched:
+            type: constant
+
 model:
     type: projects.sdf_GS_gengeration.model
     object:
