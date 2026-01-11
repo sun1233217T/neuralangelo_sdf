@@ -1,0 +1,188 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+# -----------------------------------------------------------------------------
+
+logging_iter: 9999999999999  # disable the printing logger
+
+max_epoch: 20000  # 1 epoch ~= 50 samples
+max_iter: 500000  # derived from epochs in trainer
+
+wandb_scalar_iter: 100
+wandb_image_iter: 10000
+validation_iter: 5000
+wandb_scalar_epoch: 4
+wandb_image_epoch: 400
+validation_epoch: 200
+speed_benchmark: False
+
+checkpoint:
+    save_iter: 50000
+    save_epoch: 800
+
+trainer:
+    type: projects.sdf_splatting.trainer
+    cprofile: False
+    cprofile_output: train.prof
+    epoch_based: False
+    samples_per_epoch: null
+    ema_config:
+        enabled: False
+        load_ema_checkpoint: False
+    loss_weight:
+        render: 1.0
+        eikonal: 0.1
+        curvature: 5e-4
+        # sdf_shift: 0.01
+        sdf_render: 1.0
+        sdf_neighbor_shift_loss: 0.1
+    pointcloud_sdf:
+        enabled: True
+        path: sparse/0/points3D.bin
+        num_samples: 20000
+        warmup_iters: 2000
+        end_iter: 50000
+        loss_type: huber
+        huber_delta: 0.1
+        max_error: 2.0
+    init:
+        type: none
+    amp_config:
+        enabled: False
+    depth_vis_scale: 0.5
+
+model:
+    type: projects.sdf_splatting.model
+    object:
+        sdf:
+            mlp:
+                num_layers: 1
+                hidden_dim: 256
+                skip: []
+                activ: softplus
+                activ_params:
+                    beta: 100
+                geometric_init: True
+                weight_norm: True
+                out_bias: 0.5
+                inside_out: False
+            encoding:
+                type: hashgrid
+                levels: 16
+                hashgrid:
+                    min_logres: 5
+                    max_logres: 11
+                    dict_size: 22
+                    dim: 8
+                    range: [-2,2]
+                coarse2fine:
+                    enabled: True
+                    init_active_level: 4
+                    step: 5000
+                    step_epoch: 200
+            gradient:
+                mode: numerical
+                taps: 4
+            surface_coarse:
+                enabled: False
+                num_samples: 32
+                stratified: False
+            surface_refine:
+                enabled: True
+                steps: 4
+                eps: 1e-4
+            surface_samples:
+                enabled: True
+            surface_cache:
+                enabled: False  #目前咋还是减速的
+                reset_interval: 99999999
+                cache_max_steps: 32
+                use_cache_on_hit_ratio: 0.8
+                device: cpu
+        rgb:
+            mlp:
+                num_layers: 4
+                hidden_dim: 256
+                skip: []
+                activ: relu_
+                activ_params: {}
+                weight_norm: True
+            mode: idr
+            encoding_view:
+                type: spherical
+                levels: 3
+        s_var:
+            init_val: 3.
+            anneal_end: 0.1
+    background:
+        enabled: True
+        white: False
+        mlp:
+            num_layers: 8
+            hidden_dim: 256
+            skip: [4]
+            num_layers_rgb: 2
+            hidden_dim_rgb: 128
+            skip_rgb: []
+            activ: relu
+            activ_params: {}
+            activ_density: softplus
+            activ_density_params: {}
+        view_dep: True
+        encoding:
+            type: fourier
+            levels: 10
+        encoding_view:
+            type: spherical
+            levels: 3
+    render:
+        rand_rays: 512
+        num_samples:
+            coarse: 64
+            fine: 16
+            background: 32
+        num_sample_hierarchy: 4
+        stratified: True
+    appear_embed:
+        enabled: False
+        dim: 8
+
+optim:
+    type: AdamW
+    params:
+        lr: 1e-3
+        weight_decay: 1e-2
+    sched:
+        iteration_mode: True
+        type: two_steps_with_warmup
+        warm_up_end: 5000
+        warm_up_epoch: 200
+        two_steps: [300000,400000]
+        two_steps_epoch: [12000,16000]
+        gamma: 10.0
+
+data:
+    type: projects.nerf.datasets.nerf_blender
+    root: datasets/nerf-synthetic/lego
+    use_multi_epoch_loader: True
+    num_workers: 4
+    preload: True
+    num_images:  # The number of training images.
+    train:
+        image_size: [800,800]
+        batch_size: 2
+        subset:
+        local_shift_load: True # 按照 十字 形随机采样周边像素
+    val:
+        image_size: [400,400]
+        batch_size: 2
+        subset: 4
+        max_viz_samples: 16
+    readjust:
+        center: [0.,0.,0.]
+        scale: 1.

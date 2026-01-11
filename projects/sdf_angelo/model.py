@@ -378,28 +378,15 @@ class Model(BaseModel):
     #     return output 
 
 
-    def render_rays_object(self, center, ray_unit, near, far, outside, app, stratified=False, surf_p_sample_n = 3, surf_p_sample_eps = 1e-3):
+    def render_rays_object(self, center, ray_unit, near, far, outside, app, stratified=False, surf_p_sample_n=3, surf_p_sample_eps=1e-3):
         with torch.no_grad():
             dists_base, _ = self.sample_dists_all(center, ray_unit, near, far, stratified=stratified,
-                                           surf_pts_t = None, surf_p_sample_n = surf_p_sample_n, surf_p_sample_eps = surf_p_sample_eps)  # [B,R,N,3]
+                                           surf_pts_t=None, surf_p_sample_n=surf_p_sample_n, surf_p_sample_eps=surf_p_sample_eps)  # [B,R,N,3]
         points_base = camera.get_3D_points_from_dist(center, ray_unit, dists_base)  # [B,R,N,3]
-        sdfs_base, feats_base = self.neural_sdf.forward(points_base)  # [B,R,N,1],[B,R,N,K]
-        # surf_pts, hit_mask, t_vals = self.det_surface(center, ray_unit, near, far)
-        # debug()
-        sdfs_base[outside[..., None].expand_as(sdfs_base)] = self.outside_val
-        # Compute 1st- and 2nd-order gradients.
-        rays_unit_base = ray_unit[..., None, :].expand_as(points_base).contiguous()  # [B,R,N,3]
-        gradients_base, hessians_base = self.neural_sdf.compute_gradients(points_base, training=self.training, sdf=sdfs_base)
-        normals_base = torch_F.normalize(gradients_base, dim=-1)  # [B,R,N,3]
-        rgbs_base = self.neural_rgb.forward(points_base, normals_base, rays_unit_base, feats_base, app=app)  # [B,R,N,3]
-        surface = self._surface_from_samples(center, dists_base, sdfs_base, gradients_base, rgbs_base, ray_unit, None)
-        # debug()
-        dists = dists_base
-        sdfs = sdfs_base
-        gradients = gradients_base
-        hessians = hessians_base
-        rgbs = rgbs_base
         if self.surface_samples_enabled:
+            sdfs_base = self.neural_sdf.sdf(points_base)
+            sdfs_base[outside[..., None].expand_as(sdfs_base)] = self.outside_val
+            surface = self._surface_from_samples(center, dists_base, sdfs_base, ray_unit)
             with torch.no_grad():
                 dists, surface_idx = self.sample_dists_all(center, ray_unit, near, far, stratified=stratified,
                                                           surf_pts_t=surface["t_vals"],
@@ -413,14 +400,22 @@ class Model(BaseModel):
             gradients, hessians = self.neural_sdf.compute_gradients(points, training=self.training, sdf=sdfs)
             normals = torch_F.normalize(gradients, dim=-1)
             rgbs = self.neural_rgb.forward(points, normals, rays_unit, feats, app=app)
-            if surface_idx is not None:
-                gather_idx = surface_idx[..., None].expand(-1, -1, 1, 3)
-                surface = dict(surface)
-                surface["surface_rgb"] = rgbs.gather(dim=2, index=gather_idx).squeeze(2)
-                surface["surface_sdf"] = sdfs.gather(dim=2, index=gather_idx[..., 0].unsqueeze(-1)).squeeze(2)
-                surface["surface_normal"] = gradients.gather(dim=2, index=gather_idx).squeeze(2)
-
-            
+            if surface_idx is None:
+                surface_idx = surface["surface_idx"]
+            surface = dict(surface)
+            surface["surface_rgb"], surface["surface_normal"] = self._gather_surface_attrs(gradients, rgbs, surface_idx)
+            surface["surface_sdf"] = sdfs[..., 0].gather(dim=2, index=surface_idx).squeeze(2)
+        else:
+            sdfs_base, feats_base = self.neural_sdf.forward(points_base)  # [B,R,N,1],[B,R,N,K]
+            sdfs_base[outside[..., None].expand_as(sdfs_base)] = self.outside_val
+            # Compute 1st- and 2nd-order gradients.
+            rays_unit_base = ray_unit[..., None, :].expand_as(points_base).contiguous()  # [B,R,N,3]
+            gradients, hessians = self.neural_sdf.compute_gradients(points_base, training=self.training, sdf=sdfs_base)
+            normals = torch_F.normalize(gradients, dim=-1)  # [B,R,N,3]
+            rgbs = self.neural_rgb.forward(points_base, normals, rays_unit_base, feats_base, app=app)  # [B,R,N,3]
+            surface = self._surface_from_samples(center, dists_base, sdfs_base, ray_unit, gradients=gradients, rgbs=rgbs)
+            dists = dists_base
+            sdfs = sdfs_base
         # SDF volume rendering.
         alphas = self.compute_neus_alphas(ray_unit, sdfs, gradients, dists, dist_far=far[..., None],
                                           progress=self.progress)  # [B,R,N]
@@ -450,7 +445,7 @@ class Model(BaseModel):
         return output
 
     @torch.no_grad()
-    def _surface_from_samples(self, center, dists, sdfs, gradients, rgbs, ray_unit, app):
+    def _surface_from_samples(self, center, dists, sdfs, ray_unit, gradients=None, rgbs=None):
         sdfs = sdfs[..., 0]  # [B,R,N]
         sign_flip = (sdfs[..., :-1] * sdfs[..., 1:] < 0)  # [B,R,N-1]
         hit_mask = sign_flip.any(dim=-1)  # [B,R]
@@ -483,37 +478,29 @@ class Model(BaseModel):
                 sdf_refined = torch.where(hit_mask, torch.where(done, sdf_mid, sdf_refined), sdf_refined)
             t_vals = torch.where(hit_mask, 0.5 * (t_low + t_high), t_vals)
             sdf_refined = torch.where(hit_mask, sdf_low, sdf_refined)
-        gather_idx = idx[..., None, None].expand(-1, -1, 1, 3)
-        surface_rgb = rgbs.gather(dim=2, index=gather_idx).squeeze(2)
-        # surface_sdf = sdf_refined
-        # surface_normal = gradients.gather(dim=2, index=gather_idx).squeeze(2)
-        if hit_mask.any():
-            # pts_refined = center + ray_unit * t_vals[..., None]
-            # pts_hit = pts_refined[hit_mask]
-            # rays_hit = ray_unit[hit_mask]
-            # if app is not None:
-            #     app_hit = app[..., 0, :][hit_mask]
-            # else:
-            #     app_hit = None
-            # sdfs_hit, feats_hit = self.neural_sdf.forward(pts_hit)
-            # grads_hit, _ = self.neural_sdf.compute_gradients(pts_hit, training=self.training, sdf=sdfs_hit)
-            # normals_hit = torch_F.normalize(grads_hit, dim=-1)
-            # rgbs_hit = self.neural_rgb.forward(pts_hit, normals_hit, rays_hit, feats_hit, app=app_hit)
-            surface_rgb = surface_rgb.clone()
-            # surface_normal = surface_normal.clone()
-            # surface_sdf = surface_sdf.clone()
-            # surface_rgb[hit_mask] = rgbs_hit
-            # surface_normal[hit_mask] = normals_hit
-            # surface_sdf[hit_mask] = sdfs_hit.squeeze(-1)
+        surface_idx = idx.unsqueeze(-1)  # [B,R,1]
+        surface_rgb = None
+        surface_sdf = sdf_refined
+        surface_normal = None
+        if rgbs is not None and gradients is not None:
+            surface_rgb, surface_normal = self._gather_surface_attrs(gradients, rgbs, surface_idx)
         surface_depth = t_vals[..., None] / ray_unit.norm(dim=-1, keepdim=True)
         return dict(
             hit_mask=hit_mask,
-            # surface_rgb=surface_rgb,
-            # surface_sdf=surface_sdf,
-            # surface_normal=surface_normal,
+            surface_rgb=surface_rgb,
+            surface_sdf=surface_sdf,
+            surface_normal=surface_normal,
             surface_depth=surface_depth,
             t_vals=t_vals,
+            surface_idx=surface_idx,
         )
+
+    def _gather_surface_attrs(self, gradients, rgbs, sample_idx):
+        idx = sample_idx if sample_idx.dim() == 3 else sample_idx.unsqueeze(-1)
+        gather_idx = idx[..., None].expand(-1, -1, 1, 3)
+        surface_rgb = rgbs.gather(dim=2, index=gather_idx).squeeze(2)
+        surface_normal = gradients.gather(dim=2, index=gather_idx).squeeze(2)
+        return surface_rgb, surface_normal
 
     def render_rays_background(self, center, ray_unit, far, app_outside, stratified=False):
         with torch.no_grad():

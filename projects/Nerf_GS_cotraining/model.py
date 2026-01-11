@@ -15,8 +15,8 @@ import torch.nn.functional as torch_F
 
 from imaginaire.models.base import Model as BaseModel
 from projects.nerf.utils import nerf_util, camera
-from projects.sdf_GS_gengeration.utils.modules import NeuralSDF, NeuralGS
-from projects.sdf_GS_gengeration.utils.gs_render import GaussianModel, Camera, render_analyse
+from projects.Nerf_GS_cotraining.utils.modules import NeuralSDF, NeuralGS
+from projects.Nerf_GS_cotraining.utils.gs_render import GaussianModel, Camera, render_analyse
 
 from mtools import debug
 
@@ -284,5 +284,5 @@ class Model(BaseModel):
             # Cache previous values for refinement.
             prev_t = t_vals.clone()
             prev_sdf = sdfs.clone()
-        # debug()
+        debug()
         return surface_points, hit_mask, t_vals

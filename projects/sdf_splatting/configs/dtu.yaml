@@ -8,14 +8,8 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 # -----------------------------------------------------------------------------
 
-_parent_: projects/sdf_angelo/configs/base.yaml
+_parent_: projects/sdf_splatting/configs/base.yaml
 
-max_iter: 200000
-checkpoint:
-    save_iter: 20000
-    save_epoch: 9999999999
-
-validation_iter: 5000
 model:
     object:
         sdf:
@@ -28,32 +22,10 @@ model:
             init_val: 1.4
     appear_embed:
         enabled: False
-    render:
-        rand_rays: 2048
-        num_samples:
-            coarse: 32
-            fine: 2
-            background: 32
-        num_sample_hierarchy: 5
-
-optim:
-    type: AdamW
-    params:
-        lr: 3e-3
-        weight_decay: 1e-2
-    sched:
-        iteration_mode: True
-        type: two_steps_with_warmup
-        warm_up_end: 2000
-        # warm_up_epoch: 200
-        two_steps: [100000,150000]
-        # two_steps_epoch: [12000,16000]
-        gamma: 10.0
 
 data:
-    type: projects.sdf_angelo.data
-    root: /home/sunny/data/DTU/scan24
-    # root: /home/haochen/data/DTU/scan24
+    type: projects.sdf_splatting.data
+    root: /home/haochen/data/DTU/scan24
     train:
         image_size: [1200,1600]
         batch_size: 1

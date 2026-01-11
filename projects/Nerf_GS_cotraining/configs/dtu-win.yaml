@@ -8,10 +8,10 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 # -----------------------------------------------------------------------------
 
-_parent_: projects/sdf_GS_gengeration/configs/base.yaml
+_parent_: projects/Nerf_GS_cotraining/configs/base.yaml
 
 model:
-    # type: projects.sdf_GS_gengeration.mini_model
+    # type: projects.Nerf_GS_cotraining.mini_model
     object:
         sdf:
             mlp:
@@ -58,7 +58,7 @@ GS_pretrainer:
             type: constant
 
 data:
-    type: projects.sdf_GS_gengeration.data
+    type: projects.Nerf_GS_cotraining.data
     # root: /home/haochen/data/DTU/scan24
     root: /home/sunny/data/DTU/scan24
     train:
