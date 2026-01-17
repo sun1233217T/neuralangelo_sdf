@@ -39,6 +39,8 @@ def parse_args():
     parser.add_argument("--update_fps", default=1.0, type=float,
                         help="Texture update rate in FPS. Use -1 to remove rate limit.")
     parser.add_argument("--batch_size", default=65536, type=int, help="Batch size for SDF/RGB queries.")
+    parser.add_argument("--uv_padding", default=8, type=int,
+                        help="Texel padding iterations for UV texture (0 to disable).")
     parser.add_argument("--uv_raster", choices=["gpu", "cpu"], default="gpu",
                         help="Rasterization backend for UV cache.")
     parser.add_argument("--texture_transport", choices=["png", "raw_rgba"], default="png",
@@ -270,6 +272,7 @@ def main():
         encode_base64=not use_raw,
         include_raw=use_raw,
         async_encode=args.async_encode,
+        pad_iters=args.uv_padding,
     )
 
     cam_pos = _initial_camera(mesh)

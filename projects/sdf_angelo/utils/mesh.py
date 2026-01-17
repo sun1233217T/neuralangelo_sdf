@@ -220,8 +220,41 @@ def _get_nvdiffrast():
     return dr
 
 
+def _dilate_texture(texture, mask, iterations):
+    if iterations <= 0:
+        return texture
+    if mask.numel() == 0:
+        return texture
+    tex = texture
+    mask = mask.to(device=tex.device, dtype=torch.bool)
+    if mask.all().item():
+        return tex
+    if tex.dtype not in (torch.float16, torch.float32, torch.float64):
+        tex = tex.to(dtype=torch.float32)
+    kernel = torch.ones((1, 1, 3, 3), device=tex.device, dtype=tex.dtype)
+    kernel_rgb = torch.ones((3, 1, 3, 3), device=tex.device, dtype=tex.dtype)
+    mask_f = mask.to(dtype=tex.dtype)
+    for _ in range(int(iterations)):
+        if mask.all().item():
+            break
+        mask_f_4d = mask_f.unsqueeze(0).unsqueeze(0)
+        neigh_count = torch_F.conv2d(mask_f_4d, kernel, padding=1)[0, 0]
+        new_pixels = (~mask) & (neigh_count > 0)
+        if not new_pixels.any().item():
+            break
+        tex_masked = tex * mask_f.unsqueeze(-1)
+        tex_nchw = tex_masked.permute(2, 0, 1).unsqueeze(0)
+        neigh_sum = torch_F.conv2d(tex_nchw, kernel_rgb, padding=1, groups=3)[0].permute(1, 2, 0)
+        denom = neigh_count.clamp_min(1e-6).unsqueeze(-1)
+        filled = neigh_sum / denom
+        tex[new_pixels] = filled[new_pixels]
+        mask = mask | new_pixels
+        mask_f = mask.to(dtype=tex.dtype)
+    return tex
+
+
 def bake_texture_neural(vertices, faces, uvs, neural_rgb, neural_sdf, appear_embed,
-                        texture_size=2048, batch_size=65536):
+                        texture_size=2048, batch_size=65536, pad_iters=0):
     height = width = int(texture_size)
     face_idx, bary = _rasterize_uv(uvs, faces, texture_size)
     texture = np.zeros((height, width, 3), dtype=np.uint8)
@@ -244,11 +277,16 @@ def bake_texture_neural(vertices, faces, uvs, neural_rgb, neural_sdf, appear_emb
         rgbs = _query_neural_rgb(points, neural_rgb, neural_sdf, appear_embed)
         colors = (rgbs * 255.0).astype(np.uint8)
         texture[ys[start:end], xs[start:end]] = colors
+    if pad_iters > 0:
+        tex_t = torch.from_numpy(texture).to(dtype=torch.float32) / 255.0
+        mask_t = torch.from_numpy(valid)
+        tex_t = _dilate_texture(tex_t, mask_t, pad_iters)
+        texture = (tex_t.clamp(0.0, 1.0) * 255.0).byte().cpu().numpy()
     return texture
 
 
 def bake_texture_neural_gpu(vertices, faces, uvs, neural_rgb, neural_sdf, appear_embed,
-                            texture_size=2048, batch_size=65536):
+                            texture_size=2048, batch_size=65536, pad_iters=0):
     dr = _get_nvdiffrast()
     device = next(neural_sdf.parameters()).device
     height = width = int(texture_size)
@@ -285,6 +323,8 @@ def bake_texture_neural_gpu(vertices, faces, uvs, neural_rgb, neural_sdf, appear
         colors = _query_neural_rgb_torch(points[start:end], neural_rgb, neural_sdf, appear_embed)
         coord = idx[start:end]
         texture[coord[:, 0], coord[:, 1]] = colors
+    if pad_iters > 0:
+        texture = _dilate_texture(texture, mask_2d, pad_iters)
     texture = (texture.clamp(0.0, 1.0) * 255.0).byte().cpu().numpy()
     return texture
 
@@ -429,7 +469,8 @@ def prepare_mesh_for_uv(mesh, target_faces=None, max_faces=None, keep_lcc=True,
 
 def bake_uv_texture(mesh, neural_rgb, neural_sdf, appear_embed, texture_size=2048, batch_size=65536,
                     target_faces=None, max_faces=None, keep_lcc=True, raster_mode="gpu", preprocess=True,
-                    remesh=False, remesh_target_len=0.0, remesh_iters=10, remesh_position="after"):
+                    remesh=False, remesh_target_len=0.0, remesh_iters=10, remesh_position="after",
+                    pad_iters=0):
     if preprocess:
         mesh = prepare_mesh_for_uv(
             mesh,
@@ -453,12 +494,12 @@ def bake_uv_texture(mesh, neural_rgb, neural_sdf, appear_embed, texture_size=204
     if raster_mode == "gpu":
         texture = bake_texture_neural_gpu(
             vertices_uv, faces_uv, uvs, neural_rgb, neural_sdf, appear_embed,
-            texture_size=texture_size, batch_size=batch_size
+            texture_size=texture_size, batch_size=batch_size, pad_iters=pad_iters
         )
     elif raster_mode == "cpu":
         texture = bake_texture_neural(
             vertices_uv, faces_uv, uvs, neural_rgb, neural_sdf, appear_embed,
-            texture_size=texture_size, batch_size=batch_size
+            texture_size=texture_size, batch_size=batch_size, pad_iters=pad_iters
         )
     else:
         raise ValueError(f"Unknown raster_mode: {raster_mode}")

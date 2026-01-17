@@ -36,7 +36,7 @@ from imaginaire.utils.distributed import (  # noqa: E402
 from imaginaire.utils.gpu_affinity import set_affinity  # noqa: E402
 from imaginaire.trainers.utils.get_trainer import get_trainer  # noqa: E402
 from projects.sdf_angelo.uv_viewer.uv_cache import build_uv_cache  # noqa: E402
-from projects.sdf_angelo.utils.mesh import _get_nvdiffrast  # noqa: E402
+from projects.sdf_angelo.utils.mesh import _get_nvdiffrast, _dilate_texture  # noqa: E402
 
 
 def parse_args():
@@ -51,6 +51,8 @@ def parse_args():
     parser.add_argument("--split", choices=["train", "val"], default="val")
     parser.add_argument("--texture_size", default=1024, type=int, help="UV texture resolution.")
     parser.add_argument("--batch_size", default=65536, type=int, help="Batch size for SDF/RGB queries.")
+    parser.add_argument("--uv_padding", default=8, type=int,
+                        help="Texel padding iterations for UV texture (0 to disable).")
     parser.add_argument("--uv_raster", choices=["gpu", "cpu"], default="gpu",
                         help="Rasterization backend for UV cache.")
     parser.add_argument("--mesh_space", choices=["world", "normalized"], default="world",
@@ -266,8 +268,18 @@ def _save_debug_images(out_dir, view_idx, render, target, mask, debug_info):
         json.dump(debug_info, file, indent=2)
 
 
+def _build_uv_mask(uv_cache):
+    tex_size = int(uv_cache.tex_size)
+    mask = torch.zeros((tex_size, tex_size), device=uv_cache.device, dtype=torch.bool)
+    coords = uv_cache.coords
+    if coords.numel() > 0:
+        mask[coords[:, 0], coords[:, 1]] = True
+    return mask
+
+
 def render_view_dependent_texture(uv_cache, neural_rgb, appear_embed, cam_pos_world,
-                                  sphere_center, sphere_radius, batch_size, appear_idx):
+                                  sphere_center, sphere_radius, batch_size, appear_idx,
+                                  pad_iters=0, pad_mask=None):
     device = uv_cache.device
     cam = cam_pos_world.to(device=device, dtype=torch.float32)
     center = torch.as_tensor(sphere_center, device=device, dtype=torch.float32)
@@ -298,6 +310,8 @@ def render_view_dependent_texture(uv_cache, neural_rgb, appear_embed, cam_pos_wo
     texture = torch.zeros((uv_cache.tex_size, uv_cache.tex_size, 3),
                           device=device, dtype=rgbs.dtype)
     texture[coords[:, 0], coords[:, 1]] = rgbs
+    if pad_iters > 0 and pad_mask is not None:
+        texture = _dilate_texture(texture, pad_mask, pad_iters)
     return texture.clamp(0.0, 1.0)
 
 
@@ -465,6 +479,7 @@ def main():
             raster_mode=args.uv_raster,
             batch_size=args.batch_size,
         )
+        pad_mask = _build_uv_mask(uv_cache) if args.uv_padding > 0 else None
         uvs = np.asarray(mesh.visual.uv, dtype=np.float32)
         if uvs.shape[0] != vertices_norm.shape[0]:
             raise ValueError("UVs must be per-vertex and match mesh vertices.")
@@ -524,6 +539,8 @@ def main():
                 sphere_radius=sphere_radius,
                 batch_size=args.batch_size,
                 appear_idx=appear_idx,
+                pad_iters=args.uv_padding,
+                pad_mask=pad_mask,
             )
             render, mask = renderer.render(
                 texture=texture,

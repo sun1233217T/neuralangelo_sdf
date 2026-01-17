@@ -63,6 +63,8 @@ def parse_args():
                         help="Export mesh with UV texture (xatlas + neural bake)")
     parser.add_argument("--texture_size", default=2048, type=int, help="UV texture resolution")
     parser.add_argument("--bake_batch", default=65536, type=int, help="Batch size for neural texture bake")
+    parser.add_argument("--uv_padding", default=8, type=int,
+                        help="Texel padding iterations for UV texture (0 to disable)")
     parser.add_argument("--uv_raster", choices=["gpu", "cpu"], default="gpu",
                         help="Rasterization backend for UV bake")
     parser.add_argument("--uv_remesh", action="store_true",
@@ -429,6 +431,7 @@ def main():
                 appear_embed=trainer.model_module.appear_embed,
                 texture_size=args.texture_size,
                 batch_size=args.bake_batch,
+                pad_iters=args.uv_padding,
                 target_faces=args.uv_target_faces,
                 max_faces=args.uv_max_faces,
                 keep_lcc=not args.uv_no_lcc,

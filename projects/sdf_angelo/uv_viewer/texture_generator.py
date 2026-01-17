@@ -21,13 +21,15 @@ import torch
 import torch.nn.functional as torch_F
 from PIL import Image
 
+from projects.sdf_angelo.utils.mesh import _dilate_texture
+
 
 class TextureGenerator:
 
     def __init__(self, uv_cache, neural_rgb, appear_embed, sphere_center, sphere_radius,
                  update_fps=1.0, batch_size=65536, appear_idx=None,
                  encode_base64=True, include_raw=False, async_encode=True,
-                 encode_queue_size=1):
+                 encode_queue_size=1, pad_iters=0):
         self.uv_cache = uv_cache
         self.neural_rgb = neural_rgb
         self.appear_embed = appear_embed
@@ -48,6 +50,15 @@ class TextureGenerator:
         self.encode_queue_size = max(int(encode_queue_size), 1)
         self.appear_idx = appear_idx
         self._app_value = self._init_app_value()
+        self.pad_iters = max(int(pad_iters), 0)
+        self._pad_mask = None
+        if self.pad_iters > 0:
+            coords = self.uv_cache.coords
+            tex_size = int(self.uv_cache.tex_size)
+            if coords.numel() > 0:
+                mask = torch.zeros((tex_size, tex_size), device=self.uv_cache.device, dtype=torch.bool)
+                mask[coords[:, 0], coords[:, 1]] = True
+                self._pad_mask = mask
 
         self._lock = threading.Lock()
         self._texture_b64 = None
@@ -240,6 +251,8 @@ class TextureGenerator:
         texture = torch.zeros((self.uv_cache.tex_size, self.uv_cache.tex_size, 3),
                               device=device, dtype=torch.float32)
         texture[coords[:, 0], coords[:, 1]] = rgbs
+        if self.pad_iters > 0 and self._pad_mask is not None:
+            texture = _dilate_texture(texture, self._pad_mask, self.pad_iters)
         texture = (texture.clamp(0.0, 1.0) * 255.0).byte().cpu().numpy()
         return texture
 
