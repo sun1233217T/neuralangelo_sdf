@@ -62,7 +62,9 @@ class Dataset(base.Dataset):
         sample = dict(idx=idx)
         # Get the images.
         image, image_size_raw = self.images[idx] if self.preload else self.get_image(idx)
-        image = self.preprocess_image(image)
+        image, alpha = self.preprocess_image(image)
+        if alpha is None:
+            print(f"[Dataset] Warning: image {idx} has no alpha channel.")
         # Get the cameras (intrinsics and pose).
         intr, pose = self.cameras[idx] if self.preload else self.get_camera(idx)
         intr, pose = self.preprocess_camera(intr, pose, image_size_raw)
@@ -90,7 +92,6 @@ class Dataset(base.Dataset):
                 cols_stack = torch.stack([cols, cols, cols, left_cols, right_cols], dim=1) #返回方向：【中心，上，下，左，右】
                 ray_idx = (rows_stack * self.W + cols_stack).reshape(-1)
                 image_sampled = image.flatten(1, 2)[:, ray_idx].t()  # [R,3]
-
                 sample.update(
                     ray_idx=ray_idx,
                     image_sampled=image_sampled,
@@ -106,6 +107,10 @@ class Dataset(base.Dataset):
                     intr=intr,
                     pose=pose,
                 )
+            if alpha is not None:
+                alpha_sampled = alpha.flatten(1, 2)[:, ray_idx].t()  # [R,1]
+                sample.update(alpha_sampled=alpha_sampled)
+                print(f"[Dataset] Loaded alpha channel for sample {idx} in split '{self.split}'.")
         else:  # keep image during inference
             sample.update(
                 image=image,
@@ -128,7 +133,10 @@ class Dataset(base.Dataset):
         image = image.resize((self.W, self.H))
         image = torchvision_F.to_tensor(image)
         rgb = image[:3]
-        return rgb
+        if image.shape[0] == 4:
+            alpha = image[3:]
+            return rgb, alpha
+        return rgb, None
 
     def get_camera(self, idx):
         # Camera intrinsics.

@@ -22,6 +22,7 @@ import wandb
 from imaginaire.utils.distributed import master_only
 from imaginaire.utils.visualization import wandb_image
 from projects.nerf.trainers.base import BaseTrainer
+from projects.nerf.utils import render
 from projects.sdf_angelo.utils.misc import get_scheduler, eikonal_loss, curvature_loss, sdf_shift_loss
 from projects.sdf_angelo.scripts.read_write_model import read_points3D_binary, read_points3D_text
 
@@ -42,6 +43,8 @@ class Trainer(BaseTrainer):
 
     def _init_loss(self, cfg):
         self.criteria["render"] = torch.nn.L1Loss()
+        self.criteria["opacity"] = torch.nn.L1Loss()
+        self.criteria["depth"] = torch.nn.L1Loss()
 
     def setup_scheduler(self, cfg, optim):
         return get_scheduler(cfg.optim, optim)
@@ -155,6 +158,7 @@ class Trainer(BaseTrainer):
 
     def _compute_loss(self, data, mode=None):
         if mode == "train":
+            # debug()
             # Compute loss only on randomly sampled rays.
             self.losses["render"] = self.criteria["render"](data["rgb"], data["image_sampled"]) * 3  # FIXME:sumRGB?!
             self.metrics["psnr"] = -10 * torch_F.mse_loss(data["rgb"], data["image_sampled"]).log10()
@@ -167,6 +171,25 @@ class Trainer(BaseTrainer):
                 self.losses["sdf_shift"] = sdf_shift_loss(data["sdf_offsets"], data["rgb_offsets"], data["image_sampled"], data["rgb"])
             if "sdf_render" in self.weights and "surface_rgb" in data:
                 self.losses["sdf_render"] = self.criteria["render"](data["surface_rgb"], data["image_sampled"])
+            
+            if "nerf_depth_to_sdf" in self.weights and "surface_point_from_nerf" in data:
+                surface_point = data["surface_point_from_nerf"]
+                sdf = self.model_module.neural_sdf.sdf(surface_point).squeeze(-1)
+                self.losses["surface_point_from_nerf"] = self.criteria["depth"](sdf, torch.zeros_like(sdf))
+
+            if "opacity" in self.weights and "alpha_sampled" in data:
+                opacity_pred = data.get("opacity", None)
+                if opacity_pred is None and "weights" in data:
+                    weights = data["weights"]
+                    num_bg = 0
+                    if self.cfg.model.background.enabled:
+                        num_bg = int(getattr(self.cfg.model.render.num_samples, "background", 0))
+                    if num_bg > 0 and weights.shape[2] > num_bg:
+                        weights = weights[:, :, :-num_bg, :]
+                    opacity_pred = render.composite(1.0, weights)
+                    data["opacity"] = opacity_pred
+                if opacity_pred is not None:
+                    self.losses["opacity"] = self.criteria["opacity"](opacity_pred, data["alpha_sampled"])
             self.losses.pop("pc_sdf", None)
             self.pc_sdf_weight = self._get_pc_sdf_weight(self.current_iteration)
             if "pc_sdf" in self.weights:

@@ -10,20 +10,37 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 -----------------------------------------------------------------------------
 '''
 
+
+'''
+python projects/sdf_angelo/scripts/extract_mesh.py --single_gpu\
+  --config projects/sdf_angelo/configs/dtu-win.yaml --checkpoint logs/test/sdf_fast_train_baseline/epoch_04081_iteration_000200000_checkpoint.pt \
+  --depth_visible --alpha_threshold 0.5 --resolution 1024\
+  --output_file meshout/sdf_fast_train_baseline.ply
+
+'''
+
 import argparse
 import json
 import os
 import sys
 import numpy as np
 import trimesh
+import torch
 from functools import partial
+from PIL import Image
 
 sys.path.append(os.getcwd())
 from imaginaire.config import Config, recursive_update_strict, parse_cmdline_arguments  # noqa: E402
 from imaginaire.utils.distributed import init_dist, get_world_size, is_master, master_only_print as print  # noqa: E402
 from imaginaire.utils.gpu_affinity import set_affinity  # noqa: E402
 from imaginaire.trainers.utils.get_trainer import get_trainer  # noqa: E402
-from projects.sdf_angelo.utils.mesh import extract_mesh, extract_texture, bake_uv_texture, prepare_mesh_for_uv  # noqa: E402
+from projects.sdf_angelo.utils.mesh import (  # noqa: E402
+    extract_mesh,
+    extract_texture,
+    bake_uv_texture,
+    prepare_mesh_for_uv,
+    _get_nvdiffrast,
+)
 
 
 def parse_args():
@@ -68,8 +85,238 @@ def parse_args():
                         help="Disable largest connected component filtering before UV unwrap")
     parser.add_argument("--keep_lcc", action="store_true",
                         help="Keep only largest connected component. May remove thin structures.")
+    parser.add_argument("--visible_only", action="store_true",
+                        help="Filter mesh by camera frustum and RGBA alpha mask.")
+    parser.add_argument("--alpha_threshold", default=0.5, type=float,
+                        help="Alpha threshold in [0,1] for RGBA visibility mask.")
+    parser.add_argument("--depth_visible", action="store_true",
+                        help="Use GPU rasterization for depth visibility (requires nvdiffrast).")
     args, cfg_cmd = parser.parse_known_args()
     return args, cfg_cmd
+
+
+def _gl_to_cv(gl):
+    return gl * np.array([1, -1, -1, 1], dtype=np.float32)
+
+
+def _build_intrinsics(meta):
+    fl_x = float(meta["fl_x"])
+    fl_y = float(meta["fl_y"])
+    cx = float(meta["cx"])
+    cy = float(meta["cy"])
+    sk_x = float(meta.get("sk_x", 0.0))
+    sk_y = float(meta.get("sk_y", 0.0))
+    intr = np.array([
+        [fl_x, sk_x, cx],
+        [sk_y, fl_y, cy],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    w = int(meta.get("w", 0))
+    h = int(meta.get("h", 0))
+    return intr, w, h
+
+
+def _load_alpha_mask(image_path, alpha_threshold):
+    if not os.path.isfile(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    image = Image.open(image_path)
+    image.load()
+    image = image.convert("RGBA")
+    rgba = np.asarray(image)
+    alpha = rgba[..., 3]
+    if alpha_threshold <= 0:
+        mask = np.ones(alpha.shape, dtype=bool)
+    else:
+        thresh = int(round(alpha_threshold * 255.0))
+        mask = alpha >= thresh
+    return mask, image.size
+
+
+def _filter_mesh_visibility(mesh, meta, cfg, alpha_threshold=0.5, device=None, depth_visible=False):
+    if mesh is None or len(mesh.vertices) == 0:
+        return mesh
+    if not (0.0 <= alpha_threshold <= 1.0):
+        raise ValueError("alpha_threshold must be in [0, 1].")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if depth_visible:
+        return _filter_mesh_visibility_depth(mesh, meta, cfg, alpha_threshold, device)
+
+    intr_base, meta_w, meta_h = _build_intrinsics(meta)
+    center = np.array(meta.get("sphere_center", [0.0, 0.0, 0.0]), dtype=np.float32)
+    radius = float(meta.get("sphere_radius", 1.0))
+    readjust = getattr(cfg.data, "readjust", None)
+    if readjust is not None:
+        center += np.array(getattr(readjust, "center", [0.0, 0.0, 0.0]), dtype=np.float32)
+        radius *= float(getattr(readjust, "scale", 1.0))
+    if radius <= 0:
+        raise ValueError("sphere_radius must be > 0 for visibility filtering.")
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    verts_t = torch.from_numpy(vertices).to(device=device)
+    visible = torch.zeros((verts_t.shape[0],), dtype=torch.bool, device=device)
+    frames = meta.get("frames", [])
+    if len(frames) == 0:
+        print("No frames found in transforms.json; skipping visibility filter.")
+        return mesh
+
+    print(f"Filtering mesh visibility using {len(frames)} frames...")
+    for frame in frames:
+        image_path = os.path.join(cfg.data.root, frame["file_path"])
+        alpha_mask, image_size = _load_alpha_mask(image_path, alpha_threshold)
+        img_w, img_h = image_size
+        intr = intr_base.copy()
+        if meta_w > 0 and meta_h > 0 and (img_w != meta_w or img_h != meta_h):
+            scale_x = img_w / float(meta_w)
+            scale_y = img_h / float(meta_h)
+            intr[0] *= scale_x
+            intr[1] *= scale_y
+
+        c2w_gl = np.asarray(frame["transform_matrix"], dtype=np.float32)
+        c2w = _gl_to_cv(c2w_gl)
+        c2w[:3, 3] -= center
+        c2w[:3, 3] /= radius
+        w2c = np.linalg.inv(c2w)
+        R = torch.from_numpy(w2c[:3, :3]).to(device=device)
+        t = torch.from_numpy(w2c[:3, 3]).to(device=device)
+        intr_t = torch.from_numpy(intr).to(device=device)
+
+        pts_cam = verts_t @ R.t() + t
+        z = pts_cam[:, 2]
+        valid_z = z > 1e-6
+        if not valid_z.any():
+            continue
+        valid_idx = torch.nonzero(valid_z, as_tuple=False).squeeze(1)
+        pts_cam = pts_cam[valid_idx]
+        uvw = pts_cam @ intr_t.t()
+        x = uvw[:, 0] / uvw[:, 2]
+        y = uvw[:, 1] / uvw[:, 2]
+        x_int = torch.round(x).to(dtype=torch.int64)
+        y_int = torch.round(y).to(dtype=torch.int64)
+        inside = (x_int >= 0) & (x_int < img_w) & (y_int >= 0) & (y_int < img_h)
+        if not inside.any():
+            continue
+        inside_idx = valid_idx[inside]
+        alpha_t = torch.from_numpy(alpha_mask).to(device=device)
+        alpha_ok = alpha_t[y_int[inside], x_int[inside]]
+        if alpha_ok.any():
+            visible[inside_idx[alpha_ok]] = True
+        if visible.all():
+            break
+
+    visible_cpu = visible.cpu().numpy()
+    face_mask = visible_cpu[mesh.faces].any(axis=1)
+    if not np.any(face_mask):
+        print("Visibility filter removed all faces.")
+        return trimesh.Trimesh()
+    mesh.update_faces(face_mask)
+    mesh.remove_unreferenced_vertices()
+    print(f"Visible vertices: {len(mesh.vertices)}")
+    print(f"Visible faces: {len(mesh.faces)}")
+    return mesh
+
+
+def _filter_mesh_visibility_depth(mesh, meta, cfg, alpha_threshold=0.5, device=None):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        raise RuntimeError("depth_visible requires a CUDA device.")
+
+    dr = _get_nvdiffrast()
+    ctx = dr.RasterizeCudaContext()
+    intr_base, meta_w, meta_h = _build_intrinsics(meta)
+    center = np.array(meta.get("sphere_center", [0.0, 0.0, 0.0]), dtype=np.float32)
+    radius = float(meta.get("sphere_radius", 1.0))
+    readjust = getattr(cfg.data, "readjust", None)
+    if readjust is not None:
+        center += np.array(getattr(readjust, "center", [0.0, 0.0, 0.0]), dtype=np.float32)
+        radius *= float(getattr(readjust, "scale", 1.0))
+    if radius <= 0:
+        raise ValueError("sphere_radius must be > 0 for visibility filtering.")
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.int32)
+    verts_t = torch.from_numpy(vertices).to(device=device, dtype=torch.float32)
+    tri = torch.from_numpy(faces).to(device=device, dtype=torch.int32)
+    visible_faces = torch.zeros((faces.shape[0],), dtype=torch.bool, device=device)
+    frames = meta.get("frames", [])
+    if len(frames) == 0:
+        print("No frames found in transforms.json; skipping visibility filter.")
+        return mesh
+
+    print(f"Filtering mesh visibility (depth) using {len(frames)} frames...")
+    for frame in frames:
+        image_path = os.path.join(cfg.data.root, frame["file_path"])
+        alpha_mask, image_size = _load_alpha_mask(image_path, alpha_threshold)
+        img_w, img_h = image_size
+        denom_w = max(img_w - 1, 1)
+        denom_h = max(img_h - 1, 1)
+        intr = intr_base.copy()
+        if meta_w > 0 and meta_h > 0 and (img_w != meta_w or img_h != meta_h):
+            scale_x = img_w / float(meta_w)
+            scale_y = img_h / float(meta_h)
+            intr[0] *= scale_x
+            intr[1] *= scale_y
+
+        c2w_gl = np.asarray(frame["transform_matrix"], dtype=np.float32)
+        c2w = _gl_to_cv(c2w_gl)
+        c2w[:3, 3] -= center
+        c2w[:3, 3] /= radius
+        w2c = np.linalg.inv(c2w)
+        R = torch.from_numpy(w2c[:3, :3]).to(device=device)
+        t = torch.from_numpy(w2c[:3, 3]).to(device=device)
+        intr_t = torch.from_numpy(intr).to(device=device)
+
+        pts_cam = verts_t @ R.t() + t
+        z = pts_cam[:, 2]
+        valid_z = z > 1e-6
+        if not valid_z.any():
+            continue
+        min_z = z[valid_z].min().item()
+        max_z = z[valid_z].max().item()
+        near = max(min_z * 0.9, 1e-4)
+        far = max(max_z * 1.1, near + 1e-4)
+
+        uvw = pts_cam @ intr_t.t()
+        z_safe = torch.where(valid_z, z, torch.full_like(z, near))
+        u = uvw[:, 0] / z_safe
+        v = uvw[:, 1] / z_safe
+        uv = torch.stack([u / float(denom_w), v / float(denom_h)], dim=-1)
+        uv[:, 1] = 1.0 - uv[:, 1]
+        pos = torch.empty((1, verts_t.shape[0], 4), device=device, dtype=torch.float32)
+        pos[0, :, 0:2] = uv * 2.0 - 1.0
+        pos[0, :, 2] = (2.0 * z - (far + near)) / (far - near)
+        pos[0, :, 3] = 1.0
+        invalid = ~valid_z
+        if invalid.any():
+            pos[0, invalid, 0:3] = 2.0
+
+        rast, _ = dr.rasterize(ctx, pos, tri, resolution=[img_h, img_w])
+        tri_id = rast[..., 3]
+        if tri_id.min().item() < 0:
+            mask = tri_id >= 0
+            tri_idx = tri_id.to(torch.int64)
+        else:
+            mask = tri_id > 0
+            tri_idx = tri_id.to(torch.int64) - 1
+        alpha_t = torch.from_numpy(alpha_mask).to(device=device)
+        mask = mask & alpha_t.unsqueeze(0)
+        if not mask.any():
+            continue
+        tri_visible = tri_idx[mask]
+        visible_faces[tri_visible] = True
+        if visible_faces.all():
+            break
+
+    visible_faces_cpu = visible_faces.cpu().numpy()
+    if not np.any(visible_faces_cpu):
+        print("Visibility filter removed all faces.")
+        return trimesh.Trimesh()
+    mesh.update_faces(visible_faces_cpu)
+    mesh.remove_unreferenced_vertices()
+    print(f"Visible vertices: {len(mesh.vertices)}")
+    print(f"Visible faces: {len(mesh.faces)}")
+    return mesh
 
 
 def main():
@@ -149,6 +396,15 @@ def main():
                             block_res=args.block_res, texture_func=texture_func, filter_lcc=args.keep_lcc)
 
     if is_master():
+        if args.visible_only or args.depth_visible:
+            mesh = _filter_mesh_visibility(
+                mesh,
+                meta,
+                cfg,
+                alpha_threshold=args.alpha_threshold,
+                device=next(trainer.model_module.neural_sdf.parameters()).device,
+                depth_visible=args.depth_visible,
+            )
         if args.simplify_only:
             if args.uv_textured:
                 print("Simplify-only mode enabled; skipping UV bake.")

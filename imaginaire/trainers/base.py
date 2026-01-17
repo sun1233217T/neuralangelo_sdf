@@ -511,7 +511,8 @@ class BaseTrainer(object):
                         if hasattr(self, "losses"):
                             for loss_name, loss_val in self.losses.items():
                                 if torch.is_tensor(loss_val):
-                                    postfix[loss_name] = float(loss_val.detach().item())
+                                    if loss_name in cfg.show_loss_on_bar:
+                                        postfix[loss_name] = float(loss_val.detach().item())
                         epoch_iter.set_postfix(postfix)
                     if it == len(data_loader) - 1:
                         self.end_of_iteration(data, current_epoch + 1, current_iteration)

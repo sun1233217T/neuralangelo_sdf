@@ -17,6 +17,7 @@ import wandb
 from imaginaire.utils.distributed import master_only
 from imaginaire.utils.visualization import wandb_image
 from projects.nerf.trainers.base import BaseTrainer
+from projects.nerf.utils import render
 from projects.sdf_splatting.utils.misc import get_scheduler, eikonal_loss, curvature_loss, neighbor_shift_loss
 
 
@@ -33,6 +34,7 @@ class Trainer(BaseTrainer):
 
     def _init_loss(self, cfg):
         self.criteria["render"] = torch.nn.L1Loss()
+        self.criteria["opacity"] = torch.nn.L1Loss()
 
     def setup_scheduler(self, cfg, optim):
         return get_scheduler(cfg.optim, optim)
@@ -51,6 +53,19 @@ class Trainer(BaseTrainer):
             if "sdf_neighbor_shift_loss" in self.weights and "surface_shift_target" in data:
                 self.losses["sdf_neighbor_shift_loss"] = neighbor_shift_loss(
                     data["surface_rgb"], data["image_sampled"],self.model_module.neural_sdf.sdf,data["surface_shift_target"])
+            if "opacity" in self.weights and "alpha_sampled" in data:
+                opacity_pred = data.get("opacity", None)
+                if opacity_pred is None and "weights" in data:
+                    weights = data["weights"]
+                    num_bg = 0
+                    if self.cfg.model.background.enabled:
+                        num_bg = int(getattr(self.cfg.model.render.num_samples, "background", 0))
+                    if num_bg > 0 and weights.shape[2] > num_bg:
+                        weights = weights[:, :, :-num_bg, :]
+                    opacity_pred = render.composite(1.0, weights)
+                    data["opacity"] = opacity_pred
+                if opacity_pred is not None:
+                    self.losses["opacity"] = self.criteria["opacity"](opacity_pred, data["alpha_sampled"])
         else:
             # Compute loss on the entire image.
             self.losses["render"] = self.criteria["render"](data["rgb_map"], data["image"])
@@ -107,6 +122,9 @@ class Trainer(BaseTrainer):
                 f"{mode}/vis/normal": wandb_image(data["normal_map"], from_range=(-1, 1)),
                 f"{mode}/vis/inv_depth": wandb_image(1 / (data["depth_map"] + 1e-8) * self.cfg.trainer.depth_vis_scale),
                 f"{mode}/vis/opacity": wandb_image(data["opacity_map"]),
+                f"{mode}/vis_sdf/rgb_render": wandb_image(data["sdf_rgb_map"]),
+                f"{mode}/vis_sdf/normal": wandb_image(data["sdf_normal_map"], from_range=(-1, 1)),
+                f"{mode}/vis_sdf/inv_depth": wandb_image(1 / (data["sdf_depth_map"] + 1e-8) * self.cfg.trainer.depth_vis_scale),
             })
         wandb.log(images, step=self.current_iteration)
 

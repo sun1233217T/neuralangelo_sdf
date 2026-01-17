@@ -104,6 +104,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+debug_psnr/
 
 # Translations
 *.mo

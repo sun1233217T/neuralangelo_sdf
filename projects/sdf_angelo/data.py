@@ -39,6 +39,7 @@ class Dataset(base.Dataset):
             subset_idx = np.linspace(0, len(self.list), subset+1)[:-1].astype(int)
             self.list = [self.list[i] for i in subset_idx]
         self.num_rays = cfg.model.render.rand_rays
+        self.white_bkgd = cfg.model.background.white
         self.readjust = getattr(cfg_data, "readjust", None)
         # Preload dataset if possible.
         if cfg_data.preload:
@@ -61,7 +62,7 @@ class Dataset(base.Dataset):
         sample = dict(idx=idx)
         # Get the images.
         image, image_size_raw = self.images[idx] if self.preload else self.get_image(idx)
-        image = self.preprocess_image(image)
+        image, alpha = self.preprocess_image(image)
         # Get the cameras (intrinsics and pose).
         intr, pose = self.cameras[idx] if self.preload else self.get_camera(idx)
         intr, pose = self.preprocess_camera(intr, pose, image_size_raw)
@@ -75,6 +76,12 @@ class Dataset(base.Dataset):
                 intr=intr,
                 pose=pose,
             )
+            if alpha is not None:
+                alpha_sampled = alpha.flatten(1, 2)[:, ray_idx].t()  # [R,1]
+                sample.update(alpha_sampled=alpha_sampled)
+                sample["image_sampled"] = sample["image_sampled"] * alpha_sampled if not self.white_bkgd else \
+                    sample["image_sampled"] * alpha_sampled + (1 - alpha_sampled)
+                # print(f"[Dataset] Loaded alpha channel for sample {idx} in split '{self.split}'.")
         else:  # keep image during inference
             sample.update(
                 image=image,
@@ -96,7 +103,10 @@ class Dataset(base.Dataset):
         image = image.resize((self.W, self.H))
         image = torchvision_F.to_tensor(image)
         rgb = image[:3]
-        return rgb
+        if image.shape[0] == 4:
+            alpha = image[3:].clone()
+            return rgb, alpha
+        return rgb, None
 
     def get_camera(self, idx):
         # Camera intrinsics.

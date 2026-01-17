@@ -21,6 +21,8 @@ wandb_image_epoch: 400
 validation_epoch: 200
 speed_benchmark: False
 
+show_loss_on_bar: ["render","sdf_render","opacity","nerf_depth_to_sdf"]
+
 checkpoint:
     save_iter: 20000
     save_epoch: 800
@@ -41,6 +43,8 @@ trainer:
         # sdf_shift: 0.01
         sdf_render: 1.0
         pc_sdf: 2.0
+        opacity: 0.01
+        nerf_depth_to_sdf: 0.01
     pointcloud_sdf:
         enabled: True
         path: sparse/0/points3D.bin

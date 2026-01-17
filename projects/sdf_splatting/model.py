@@ -267,23 +267,34 @@ class Model(BaseModel):
     def _surface_from_samples(self, center, dists, sdfs, ray_unit, gradients=None, rgbs=None):
         # Find the first sign change along each ray; optionally refine with bisection.
         sdfs = sdfs[..., 0]  # [B,R,N]
+        eps = 1e-8
+        # Use sign-flip bracket when available; otherwise use neighbors around min |sdf|.
         sign_flip = (sdfs[..., :-1] * sdfs[..., 1:] < 0)  # [B,R,N-1]
-        hit_mask = sign_flip.any(dim=-1)  # [B,R]
-        idx = sign_flip.float().argmax(dim=-1)  # [B,R]
-        d0 = dists[..., :-1, 0].gather(dim=-1, index=idx.unsqueeze(-1)).squeeze(-1)
-        d1 = dists[..., 1:, 0].gather(dim=-1, index=idx.unsqueeze(-1)).squeeze(-1)
-        s0 = sdfs[..., :-1].gather(dim=-1, index=idx.unsqueeze(-1)).squeeze(-1)
-        s1 = sdfs[..., 1:].gather(dim=-1, index=idx.unsqueeze(-1)).squeeze(-1)
+        sign_hit_mask = sign_flip.any(dim=-1)  # [B,R]
+        idx_sign = sign_flip.float().argmax(dim=-1)  # [B,R]
+        dists_flat = dists[..., 0]  # [B,R,N]
+        min_abs_idx = sdfs.abs().argmin(dim=-1)  # [B,R]
+        num_samples = sdfs.shape[-1]
+        idx_prev = (min_abs_idx - 1).clamp(min=0)
+        idx_next = (min_abs_idx + 1).clamp(max=num_samples - 1)
+
+        idx0 = torch.where(sign_hit_mask, idx_sign, idx_prev)
+        idx1 = torch.where(sign_hit_mask, idx_sign + 1, idx_next)
+        d0 = dists_flat.gather(dim=-1, index=idx0.unsqueeze(-1)).squeeze(-1)
+        d1 = dists_flat.gather(dim=-1, index=idx1.unsqueeze(-1)).squeeze(-1)
+        s0 = sdfs.gather(dim=-1, index=idx0.unsqueeze(-1)).squeeze(-1)
+        s1 = sdfs.gather(dim=-1, index=idx1.unsqueeze(-1)).squeeze(-1)
+        idx = torch.where(sign_hit_mask, idx_sign, min_abs_idx)
+
         denom = s1 - s0
-        denom = torch.where(denom.abs() < 1e-8, torch.full_like(denom, 1e-8), denom)
+        denom = torch.where(denom.abs() < eps, torch.full_like(denom, eps), denom)
         t_vals = d0 + (-s0 / denom) * (d1 - d0)
-        t_vals = torch.where(hit_mask, t_vals, d0)
+        t_vals = torch.max(torch.min(t_vals, d1), d0)
         sdf_refined = s0
-        if self.surface_refine_enabled and hit_mask.any():
+        if self.surface_refine_enabled:
             t_low = d0
             t_high = d1
             sdf_low = s0
-            sdf_high = s1
             for _ in range(self.surface_refine_steps):
                 t_mid = 0.5 * (t_low + t_high)
                 pts_mid = center + ray_unit * t_mid[..., None]
@@ -291,13 +302,13 @@ class Model(BaseModel):
                 done = (sdf_mid.abs() < self.surface_refine_eps)
                 go_low = (sdf_low * sdf_mid < 0)
                 t_high = torch.where(go_low, t_mid, t_high)
-                sdf_high = torch.where(go_low, sdf_mid, sdf_high)
                 t_low = torch.where(go_low, t_low, t_mid)
                 sdf_low = torch.where(go_low, sdf_low, sdf_mid)
-                t_vals = torch.where(hit_mask, torch.where(done, t_mid, t_vals), t_vals)
-                sdf_refined = torch.where(hit_mask, torch.where(done, sdf_mid, sdf_refined), sdf_refined)
-            t_vals = torch.where(hit_mask, 0.5 * (t_low + t_high), t_vals)
-            sdf_refined = torch.where(hit_mask, sdf_low, sdf_refined)
+                t_vals = torch.where(done, t_mid, t_vals)
+                sdf_refined = torch.where(done, sdf_mid, sdf_refined)
+            t_vals = 0.5 * (t_low + t_high)
+            sdf_refined = sdf_low
+        hit_mask = sign_hit_mask | (sdf_refined.abs() < self.surface_refine_eps)
         surface_idx = idx.unsqueeze(-1)  # [B,R,1]
         surface_rgb = None
         surface_sdf = sdf_refined
