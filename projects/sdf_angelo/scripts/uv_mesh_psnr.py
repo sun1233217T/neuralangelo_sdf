@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument("--split", choices=["train", "val"], default="val")
     parser.add_argument("--texture_size", default=1024, type=int, help="UV texture resolution.")
     parser.add_argument("--batch_size", default=65536, type=int, help="Batch size for SDF/RGB queries.")
-    parser.add_argument("--uv_padding", default=8, type=int,
+    parser.add_argument("--uv_padding", default=2, type=int,
                         help="Texel padding iterations for UV texture (0 to disable).")
     parser.add_argument("--uv_raster", choices=["gpu", "cpu"], default="gpu",
                         help="Rasterization backend for UV cache.")
