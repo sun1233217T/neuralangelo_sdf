@@ -105,6 +105,7 @@ coverage.xml
 .pytest_cache/
 cover/
 debug_psnr/
+meshout/
 
 # Translations
 *.mo

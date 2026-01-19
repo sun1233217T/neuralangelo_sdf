@@ -259,6 +259,8 @@ def main():
         batch_size=args.batch_size,
     )
 
+    del trainer.model_module.neural_sdf # Not needed for texture generation
+
     use_raw = args.texture_transport == "raw_rgba"
     generator = TextureGenerator(
         uv_cache=uv_cache,
