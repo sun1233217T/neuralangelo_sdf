@@ -175,7 +175,7 @@ class Trainer(BaseTrainer):
             if "nerf_depth_to_sdf" in self.weights and "surface_point_from_nerf" in data:
                 surface_point = data["surface_point_from_nerf"]
                 sdf = self.model_module.neural_sdf.sdf(surface_point).squeeze(-1)
-                self.losses["surface_point_from_nerf"] = self.criteria["depth"](sdf, torch.zeros_like(sdf))
+                self.losses["nerf_depth_to_sdf"] = self.criteria["depth"](sdf, torch.zeros_like(sdf))
 
             if "opacity" in self.weights and "alpha_sampled" in data:
                 opacity_pred = data.get("opacity", None)

@@ -10,7 +10,7 @@
 
 _parent_: projects/sdf_angelo/configs/base.yaml
 
-max_iter: 200000
+max_iter: 120000
 checkpoint:
     save_iter: 20000
     save_epoch: 9999999999
