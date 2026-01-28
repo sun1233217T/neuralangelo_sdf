@@ -57,6 +57,8 @@ def parse_args():
                         help="Coordinate space of input mesh")
     parser.add_argument("--bounds_scale", default=1.0, type=float,
                         help="Uniform scale factor applied to extraction bounds (centered)")
+    parser.add_argument("--output_space", choices=["colmap", "normalized"], default="colmap",
+                        help="Coordinate space for exported mesh vertices.")
     parser.add_argument("--output_file", default="mesh.ply", type=str, help="Output file name")
     parser.add_argument("--textured", action="store_true", help="Export mesh with texture")
     parser.add_argument("--uv_textured", action="store_true",
@@ -357,8 +359,15 @@ def main():
     with open(meta_fname) as file:
         meta = json.load(file)
 
+    readjust = getattr(cfg.data, "readjust", None)
+    sphere_center = np.array(meta["sphere_center"], dtype=np.float32)
+    sphere_radius = float(meta["sphere_radius"])
+    if readjust is not None:
+        sphere_center = sphere_center + np.array(getattr(readjust, "center", [0.0, 0.0, 0.0]), dtype=np.float32)
+        sphere_radius = sphere_radius * float(getattr(readjust, "scale", 1.0))
+
     if "aabb_range" in meta:
-        bounds = (np.array(meta["aabb_range"]) - np.array(meta["sphere_center"])[..., None]) / meta["sphere_radius"]
+        bounds = (np.array(meta["aabb_range"]) - sphere_center[..., None]) / sphere_radius
     else:
         bounds = np.array([[-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0]])
 
@@ -369,9 +378,6 @@ def main():
         half = (bounds[:, 1] - bounds[:, 0]) * 0.5 * args.bounds_scale
         bounds = np.stack([center - half, center + half], axis=1)
         print(f"Scaled bounds by {args.bounds_scale}: {bounds.tolist()}")
-    sphere_center = np.array(meta["sphere_center"], dtype=np.float32)
-    sphere_radius = float(meta["sphere_radius"])
-
     mesh = None
     if args.input_mesh:
         if not os.path.isfile(args.input_mesh):
@@ -448,8 +454,10 @@ def main():
             print(f"colors: {len(mesh.visual.vertex_colors)}")
         if args.textured and args.uv_textured and not args.simplify_only:
             print("Both --textured and --uv_textured are set. Using UV texture output.")
-        # center and scale
-        mesh.vertices = mesh.vertices * sphere_radius + sphere_center
+        if args.output_space == "colmap":
+            mesh.vertices = mesh.vertices * sphere_radius + sphere_center
+        elif args.output_space != "normalized":
+            raise ValueError(f"Unknown output_space: {args.output_space}")
         mesh.update_faces(mesh.nondegenerate_faces())
         output_file = args.output_file
         if args.uv_textured and not args.simplify_only:

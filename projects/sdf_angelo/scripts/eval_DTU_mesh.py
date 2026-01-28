@@ -1,5 +1,7 @@
 # adapted from https://github.com/jzhangbs/DTUeval-python
 import os
+import re
+import json
 import numpy as np
 import open3d as o3d
 import sklearn.neighbors as skln
@@ -46,6 +48,127 @@ def _load_scale_mat(scale_mat_path):
         scale_mat = scale_data[scale_keys[0]]
     return scale_mat.reshape(4, 4)
 
+
+def _gl_to_cv(gl):
+    return gl * np.array([1, -1, -1, 1], dtype=np.float32)
+
+
+def _frame_to_index(file_path):
+    base = os.path.basename(file_path)
+    match = re.search(r'(\d+)', base)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _load_colmap_centers(transforms_json):
+    with open(transforms_json, 'r') as fp:
+        meta = json.load(fp)
+    frames = meta.get('frames', [])
+    centers = {}
+    for frame in frames:
+        file_path = frame.get('file_path', '')
+        idx = _frame_to_index(file_path)
+        if idx is None:
+            continue
+        c2w_gl = np.asarray(frame['transform_matrix'], dtype=np.float32)
+        c2w_cv = _gl_to_cv(c2w_gl)
+        centers[idx] = c2w_cv[:3, 3].astype(np.float32)
+    if not centers:
+        raise ValueError(f'No valid frames found in {transforms_json}')
+    return centers
+
+
+def _load_dtu_centers(camera_npz_path):
+    data = np.load(camera_npz_path)
+    centers = {}
+    for key in data.keys():
+        if not key.startswith('world_mat_'):
+            continue
+        if key.startswith('world_mat_inv_') or '_inv_' in key:
+            continue
+        try:
+            idx = int(key.split('_')[-1])
+        except ValueError:
+            continue
+        P = np.asarray(data[key], dtype=np.float32)[:3, :4]
+        _, _, Vt = np.linalg.svd(P)
+        C = Vt[-1]
+        if abs(C[3]) < 1e-8:
+            continue
+        C = (C[:3] / C[3]).astype(np.float32)
+        centers[idx] = C
+    if not centers:
+        raise ValueError(f'No world_mat_* found in {camera_npz_path}')
+    return centers
+
+
+def _resolve_camera_npz_path(dataset_dir, scan, camera_npz_path, scale_mat_path):
+    candidates = []
+    if camera_npz_path:
+        if os.path.isdir(camera_npz_path):
+            candidates.extend([
+                os.path.join(camera_npz_path, "cameras.npz"),
+                os.path.join(camera_npz_path, f"scan{scan}", "cameras.npz"),
+                os.path.join(camera_npz_path, f"scan{scan:03}", "cameras.npz"),
+            ])
+        else:
+            candidates.append(camera_npz_path)
+    if scale_mat_path:
+        if os.path.isdir(scale_mat_path):
+            candidates.extend([
+                os.path.join(scale_mat_path, "cameras.npz"),
+                os.path.join(scale_mat_path, f"scan{scan}", "cameras.npz"),
+                os.path.join(scale_mat_path, f"scan{scan:03}", "cameras.npz"),
+            ])
+        else:
+            candidates.append(scale_mat_path)
+    candidates.extend([
+        os.path.join(dataset_dir, "cameras.npz"),
+        os.path.join(dataset_dir, f"scan{scan}", "cameras.npz"),
+        os.path.join(dataset_dir, f"scan{scan:03}", "cameras.npz"),
+    ])
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            data = np.load(path)
+            if any(key.startswith('world_mat_') for key in data.keys()):
+                return path
+        except Exception:
+            continue
+    raise FileNotFoundError(
+        "cameras.npz not found (needs world_mat_*). Provide --dtu_camera_npz "
+        "or set --scale_mat_path/--dataset_dir to a folder containing cameras.npz."
+    )
+
+
+def _estimate_similarity_transform(src, dst, with_scale=True):
+    if src.shape != dst.shape or src.shape[0] < 3:
+        raise ValueError("Need at least 3 matched points to estimate similarity transform.")
+    num = src.shape[0]
+    src_mean = src.mean(axis=0)
+    dst_mean = dst.mean(axis=0)
+    src_d = src - src_mean
+    dst_d = dst - dst_mean
+    cov = (dst_d.T @ src_d) / float(num)
+    U, S, Vt = np.linalg.svd(cov)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        Vt[-1] *= -1
+        R = U @ Vt
+    if with_scale:
+        var_src = (src_d ** 2).sum() / float(num)
+        scale = S.sum() / var_src
+    else:
+        scale = 1.0
+    t = dst_mean - scale * (R @ src_mean)
+    return scale, R, t
+
+
+def _apply_similarity(points, scale, R, t):
+    return scale * (points @ R.T) + t
+
 def sample_single_tri(input_):
     n1, n2, v1, v2, tri_vert = input_
     c = np.mgrid[:n1+1, :n2+1]
@@ -79,6 +202,16 @@ if __name__ == '__main__':
                         help='Apply DTU scale_mat (normalized -> world) before evaluation')
     parser.add_argument('--scale_mat_path', type=str, default='',
                         help='Path to cameras_sphere.npz or DTU root/scan folder')
+    parser.add_argument('--align_cameras', action='store_true',
+                        help='Align COLMAP mesh to DTU world using camera centers.')
+    parser.add_argument('--transforms_json', type=str, default='',
+                        help='Path to COLMAP transforms.json (used for training/extraction).')
+    parser.add_argument('--dtu_camera_npz', type=str, default='',
+                        help='Path to DTU cameras.npz containing world_mat_*.')
+    parser.add_argument('--export_gt_colmap', action='store_true',
+                        help='Export GT point cloud in COLMAP space (requires --align_cameras).')
+    parser.add_argument('--export_gt_dtu', action='store_true',
+                        help='Export GT point cloud in DTU world space.')
     parser.add_argument('--patch_size', type=float, default=60)
     parser.add_argument('--max_dist', type=float, default=20)
     parser.add_argument('--visualize_threshold', type=float, default=10)
@@ -121,7 +254,32 @@ if __name__ == '__main__':
         data_pcd_o3d = o3d.io.read_point_cloud(args.data)
         data_pcd = np.asarray(data_pcd_o3d.points)
 
-    if args.apply_scale_mat:
+    align_params = None
+    if args.align_cameras:
+        if not args.transforms_json:
+            raise ValueError('--transforms_json is required when --align_cameras is set.')
+        camera_npz_path = _resolve_camera_npz_path(
+            args.dataset_dir, args.scan, args.dtu_camera_npz, args.scale_mat_path
+        )
+        colmap_centers = _load_colmap_centers(args.transforms_json)
+        dtu_centers = _load_dtu_centers(camera_npz_path)
+        common = sorted(set(colmap_centers) & set(dtu_centers))
+        if len(common) < 3:
+            raise ValueError(f'Need at least 3 matched cameras, found {len(common)}.')
+        src = np.stack([colmap_centers[i] for i in common], axis=0)
+        dst = np.stack([dtu_centers[i] for i in common], axis=0)
+        scale, R, t = _estimate_similarity_transform(src, dst, with_scale=True)
+        aligned = _apply_similarity(src, scale, R, t)
+        rmse = np.sqrt(np.mean(np.sum((aligned - dst) ** 2, axis=1)))
+        data_pcd = _apply_similarity(data_pcd, scale, R, t)
+        align_params = (scale, R, t)
+        print(
+            f'align_cameras: {len(common)} views, scale={scale:.6f}, '
+            f'rmse={rmse:.6f}, camera_npz={camera_npz_path}'
+        )
+        if args.apply_scale_mat:
+            print('align_cameras enabled; ignoring --apply_scale_mat to avoid double transform.')
+    elif args.apply_scale_mat:
         scale_mat_path = _resolve_scale_mat_path(args.dataset_dir, args.scan, args.scale_mat_path)
         scale_mat = _load_scale_mat(scale_mat_path)
         data_pcd = data_pcd @ scale_mat[:3, :3].T + scale_mat[:3, 3]
@@ -169,6 +327,18 @@ if __name__ == '__main__':
     pbar.set_description('read STL pcd')
     stl_pcd = o3d.io.read_point_cloud(f'{args.dataset_dir}/Points/stl/stl{args.scan:03}_total.ply')
     stl = np.asarray(stl_pcd.points)
+
+    if args.export_gt_dtu:
+        stl_color = np.ones_like(stl, dtype=np.float64)
+        write_vis_pcd(f'{args.vis_out_dir}/gt_dtu_{args.scan:03}.ply', stl, stl_color)
+
+    if args.export_gt_colmap:
+        if align_params is None:
+            raise ValueError('--export_gt_colmap requires --align_cameras.')
+        scale, R, t = align_params
+        stl_colmap = (stl - t) @ R / scale
+        stl_color = np.ones_like(stl_colmap, dtype=np.float64)
+        write_vis_pcd(f'{args.vis_out_dir}/gt_colmap_{args.scan:03}.ply', stl_colmap, stl_color)
 
     pbar.update(1)
     pbar.set_description('compute data2stl')
@@ -228,7 +398,7 @@ if __name__ == '__main__':
     print(mean_d2s, mean_s2d, over_all)
     
     import json
-    with open(f'{args.vis_out_dir}/results.json', 'w') as fp:
+    with open(f'{args.vis_out_dir}/results_{args.scan:03}.json', 'w') as fp:
         json.dump({
             'mean_d2s': mean_d2s,
             'mean_s2d': mean_s2d,

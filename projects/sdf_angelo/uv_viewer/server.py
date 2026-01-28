@@ -26,15 +26,19 @@ from imaginaire.config import Config, recursive_update_strict, parse_cmdline_arg
 from imaginaire.utils.distributed import init_dist, get_world_size, is_master, master_only_print as print  # noqa: E402
 from imaginaire.utils.gpu_affinity import set_affinity  # noqa: E402
 from imaginaire.trainers.utils.get_trainer import get_trainer  # noqa: E402
-from projects.sdf_angelo.uv_viewer.uv_cache import build_uv_cache  # noqa: E402
+from projects.sdf_angelo.uv_viewer.uv_cache import build_uv_cache, save_uv_bundle, load_uv_bundle  # noqa: E402
 from projects.sdf_angelo.uv_viewer.texture_generator import TextureGenerator  # noqa: E402
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="UV Mesh Viewer Server")
-    parser.add_argument("--config", required=True, help="Path to the training config file.")
-    parser.add_argument("--checkpoint", required=True, help="Checkpoint path.")
-    parser.add_argument("--mesh", required=True, help="Path to UV mesh (OBJ).")
+    parser.add_argument("--config", required=False, help="Path to the training config file.")
+    parser.add_argument("--checkpoint", required=False, help="Checkpoint path.")
+    parser.add_argument("--mesh", required=False, help="Path to UV mesh (OBJ).")
+    parser.add_argument("--uv_bundle", default="", type=str,
+                        help="Load a precomputed UV bundle (uv_cache + neural_rgb/appear_embed).")
+    parser.add_argument("--save_uv_bundle", default="", type=str,
+                        help="Save a UV bundle after building the cache.")
     parser.add_argument("--texture_size", default=1024, type=int, help="UV texture resolution.")
     parser.add_argument("--update_fps", default=1.0, type=float,
                         help="Texture update rate in FPS. Use -1 to remove rate limit.")
@@ -43,6 +47,14 @@ def parse_args():
                         help="Texel padding iterations for UV texture (0 to disable).")
     parser.add_argument("--uv_raster", choices=["gpu", "cpu"], default="gpu",
                         help="Rasterization backend for UV cache.")
+    parser.add_argument("--uv_project_to_surface", action="store_true",
+                        help="Project UV texels to the SDF=0 surface before caching.")
+    parser.add_argument("--uv_project_iters", default=1, type=int,
+                        help="Projection iterations when uv_project_to_surface is enabled.")
+    parser.add_argument("--uv_project_step", default=1.0, type=float,
+                        help="Projection step scale when uv_project_to_surface is enabled.")
+    parser.add_argument("--uv_project_max_step", default=0.0, type=float,
+                        help="Clamp per-iter projection step length (0 to disable).")
     parser.add_argument("--texture_transport", choices=["png", "raw_rgba"], default="png",
                         help="Texture transport format for the browser.")
     parser.add_argument("--async_encode", dest="async_encode", action="store_true",
@@ -177,6 +189,15 @@ def _initial_camera(mesh):
     return cam_pos
 
 
+def _initial_camera_from_bounds(bounds):
+    bounds = np.asarray(bounds, dtype=np.float32)
+    center = bounds.mean(axis=0)
+    size = bounds[1] - bounds[0]
+    radius = np.linalg.norm(size) * 0.6
+    cam_pos = center + np.array([0.0, 0.0, max(radius, 1.0) * 2.5], dtype=np.float32)
+    return cam_pos
+
+
 def _get_cuda_stats():
     if not torch.cuda.is_available():
         return {
@@ -213,77 +234,154 @@ def _write_stats_headers(handler, stats):
 def main():
     args, cfg_cmd = parse_args()
     set_affinity(args.local_rank)
-    cfg = Config(args.config)
-    cfg_cmd = parse_cmdline_arguments(cfg_cmd)
-    recursive_update_strict(cfg, cfg_cmd)
+    if args.uv_bundle:
+        device = torch.device(f"cuda:{int(args.local_rank)}" if torch.cuda.is_available() else "cpu")
+        uv_cache, neural_rgb, appear_embed, meta = load_uv_bundle(args.uv_bundle, device=device)
+        sphere_center = np.asarray(meta.get("sphere_center", [0.0, 0.0, 0.0]), dtype=np.float32)
+        sphere_radius = float(meta.get("sphere_radius", 1.0))
 
-    if not args.single_gpu:
-        os.environ["NCLL_BLOCKING_WAIT"] = "0"
-        os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
-        cfg.local_rank = args.local_rank
-        init_dist(cfg.local_rank, rank=-1, world_size=-1)
-    print(f"Launching UV viewer server with {get_world_size()} GPUs.")
-    cfg.logdir = ''
+        mesh = None
+        mesh_obj = None
+        cam_pos = None
+        if args.mesh:
+            mesh = _load_mesh(args.mesh)
+            if not hasattr(mesh, "visual") or mesh.visual is None or getattr(mesh.visual, "uv", None) is None:
+                raise ValueError("Input mesh does not contain UV coordinates.")
+            mesh_obj = mesh.export(file_type="obj")
+            if isinstance(mesh_obj, bytes):
+                mesh_obj = mesh_obj.decode("utf-8", errors="ignore")
+            cam_pos = _initial_camera(mesh)
+        else:
+            mesh_obj = meta.get("mesh_obj")
+            if mesh_obj is None:
+                raise ValueError("Bundle missing mesh_obj. Please pass --mesh.")
+            if isinstance(mesh_obj, bytes):
+                mesh_obj = mesh_obj.decode("utf-8", errors="ignore")
+            init_cam = meta.get("init_camera")
+            if init_cam is not None:
+                cam_pos = np.asarray(init_cam, dtype=np.float32)
+            else:
+                bounds = meta.get("mesh_bounds")
+                if bounds is None:
+                    raise ValueError("Bundle missing init_camera/mesh_bounds. Please pass --mesh.")
+                cam_pos = _initial_camera_from_bounds(bounds)
 
-    trainer = get_trainer(cfg, is_inference=True, seed=0)
-    trainer.checkpointer.load(args.checkpoint, load_opt=False, load_sch=False)
-    trainer.model.eval()
-    trainer.current_iteration = trainer.checkpointer.eval_iteration
-    if cfg.model.object.sdf.encoding.coarse2fine.enabled:
-        trainer.model_module.neural_sdf.set_active_levels(trainer.current_iteration)
-        if cfg.model.object.sdf.gradient.mode == "numerical":
-            trainer.model_module.neural_sdf.set_normal_epsilon()
+        if is_master():
+            print(f"UV texture size: {uv_cache.tex_size}")
+    else:
+        if not args.config or not args.checkpoint or not args.mesh:
+            raise ValueError("config/checkpoint/mesh are required unless --uv_bundle is provided.")
+        cfg = Config(args.config)
+        cfg_cmd = parse_cmdline_arguments(cfg_cmd)
+        recursive_update_strict(cfg, cfg_cmd)
 
-    meta_fname = f"{cfg.data.root}/transforms.json"
-    with open(meta_fname) as file:
-        meta = json.load(file)
-    sphere_center = np.array(meta["sphere_center"], dtype=np.float32)
-    sphere_radius = float(meta["sphere_radius"])
+        if not args.single_gpu:
+            os.environ["NCLL_BLOCKING_WAIT"] = "0"
+            os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
+            cfg.local_rank = args.local_rank
+            init_dist(cfg.local_rank, rank=-1, world_size=-1)
+        print(f"Launching UV viewer server with {get_world_size()} GPUs.")
+        cfg.logdir = ''
 
-    mesh = _load_mesh(args.mesh)
-    if not hasattr(mesh, "visual") or mesh.visual is None or getattr(mesh.visual, "uv", None) is None:
-        raise ValueError("Input mesh does not contain UV coordinates.")
+        trainer = get_trainer(cfg, is_inference=True, seed=0)
+        trainer.checkpointer.load(args.checkpoint, load_opt=False, load_sch=False)
+        trainer.model.eval()
+        trainer.current_iteration = trainer.checkpointer.eval_iteration
+        if cfg.model.object.sdf.encoding.coarse2fine.enabled:
+            trainer.model_module.neural_sdf.set_active_levels(trainer.current_iteration)
+            if cfg.model.object.sdf.gradient.mode == "numerical":
+                trainer.model_module.neural_sdf.set_normal_epsilon()
 
-    if is_master():
-        print(f"Mesh vertices: {len(mesh.vertices)}")
-        print(f"Mesh faces: {len(mesh.faces)}")
-        print(f"UV texture size: {args.texture_size}")
+        meta_fname = f"{cfg.data.root}/transforms.json"
+        with open(meta_fname) as file:
+            meta = json.load(file)
+        sphere_center = np.array(meta["sphere_center"], dtype=np.float32)
+        sphere_radius = float(meta["sphere_radius"])
 
-    uv_cache = build_uv_cache(
-        mesh,
-        trainer.model_module.neural_sdf,
-        sphere_center=sphere_center,
-        sphere_radius=sphere_radius,
-        texture_size=args.texture_size,
-        raster_mode=args.uv_raster,
-        batch_size=args.batch_size,
-    )
+        mesh = _load_mesh(args.mesh)
+        if not hasattr(mesh, "visual") or mesh.visual is None or getattr(mesh.visual, "uv", None) is None:
+            raise ValueError("Input mesh does not contain UV coordinates.")
 
-    del trainer.model_module.neural_sdf # Not needed for texture generation
+        if is_master():
+            print(f"Mesh vertices: {len(mesh.vertices)}")
+            print(f"Mesh faces: {len(mesh.faces)}")
+            print(f"UV texture size: {args.texture_size}")
 
-    use_raw = args.texture_transport == "raw_rgba"
-    generator = TextureGenerator(
-        uv_cache=uv_cache,
-        neural_rgb=trainer.model_module.neural_rgb,
-        appear_embed=trainer.model_module.appear_embed,
-        sphere_center=sphere_center,
-        sphere_radius=sphere_radius,
-        update_fps=args.update_fps,
-        batch_size=args.batch_size,
-        appear_idx=args.appear_idx,
-        encode_base64=not use_raw,
-        include_raw=use_raw,
-        async_encode=args.async_encode,
-        pad_iters=args.uv_padding,
-    )
+        uv_cache = build_uv_cache(
+            mesh,
+            trainer.model_module.neural_sdf,
+            sphere_center=sphere_center,
+            sphere_radius=sphere_radius,
+            texture_size=args.texture_size,
+            raster_mode=args.uv_raster,
+            batch_size=args.batch_size,
+            project_to_surface=args.uv_project_to_surface,
+            project_iters=args.uv_project_iters,
+            project_step=args.uv_project_step,
+            project_max_step=args.uv_project_max_step,
+        )
 
-    cam_pos = _initial_camera(mesh)
-    generator.update_camera(cam_pos)
-    generator.start()
+        del trainer.model_module.neural_sdf  # Not needed for texture generation
 
-    mesh_obj = mesh.export(file_type="obj")
-    if isinstance(mesh_obj, bytes):
-        mesh_obj = mesh_obj.decode("utf-8", errors="ignore")
+        if args.save_uv_bundle:
+            mesh_obj = mesh.export(file_type="obj")
+            if isinstance(mesh_obj, bytes):
+                mesh_obj = mesh_obj.decode("utf-8", errors="ignore")
+            save_uv_bundle(
+                args.save_uv_bundle,
+                uv_cache,
+                trainer.model_module.neural_rgb,
+                trainer.model_module.appear_embed,
+                sphere_center=sphere_center,
+                sphere_radius=sphere_radius,
+                mesh_obj=mesh_obj,
+                mesh_bounds=mesh.bounds,
+                init_camera=_initial_camera(mesh),
+            )
+
+        use_raw = args.texture_transport == "raw_rgba"
+        generator = TextureGenerator(
+            uv_cache=uv_cache,
+            neural_rgb=trainer.model_module.neural_rgb,
+            appear_embed=trainer.model_module.appear_embed,
+            sphere_center=sphere_center,
+            sphere_radius=sphere_radius,
+            update_fps=args.update_fps,
+            batch_size=args.batch_size,
+            appear_idx=args.appear_idx,
+            encode_base64=not use_raw,
+            include_raw=use_raw,
+            async_encode=args.async_encode,
+            pad_iters=args.uv_padding,
+        )
+
+        cam_pos = _initial_camera(mesh)
+        generator.update_camera(cam_pos)
+        generator.start()
+
+        mesh_obj = mesh.export(file_type="obj")
+        if isinstance(mesh_obj, bytes):
+            mesh_obj = mesh_obj.decode("utf-8", errors="ignore")
+
+    if args.uv_bundle:
+        use_raw = args.texture_transport == "raw_rgba"
+        generator = TextureGenerator(
+            uv_cache=uv_cache,
+            neural_rgb=neural_rgb,
+            appear_embed=appear_embed,
+            sphere_center=sphere_center,
+            sphere_radius=sphere_radius,
+            update_fps=args.update_fps,
+            batch_size=args.batch_size,
+            appear_idx=args.appear_idx,
+            encode_base64=not use_raw,
+            include_raw=use_raw,
+            async_encode=args.async_encode,
+            pad_iters=args.uv_padding,
+        )
+
+        generator.update_camera(cam_pos)
+        generator.start()
 
     update_ms = 0 if args.update_fps < 0 else 1000.0 / max(args.update_fps, 1e-6)
     api = APIContext(
