@@ -35,15 +35,17 @@ from imaginaire.utils.distributed import (  # noqa: E402
 )
 from imaginaire.utils.gpu_affinity import set_affinity  # noqa: E402
 from imaginaire.trainers.utils.get_trainer import get_trainer  # noqa: E402
-from projects.sdf_angelo.uv_viewer.uv_cache import build_uv_cache  # noqa: E402
+from projects.sdf_angelo.uv_viewer.uv_cache import build_uv_cache, load_uv_bundle  # noqa: E402
 from projects.sdf_angelo.utils.mesh import _get_nvdiffrast, _dilate_texture  # noqa: E402
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="UV mesh PSNR evaluation")
     parser.add_argument("--config", required=True, help="Path to the training config file.")
-    parser.add_argument("--checkpoint", required=True, help="Checkpoint path.")
+    parser.add_argument("--checkpoint", required=False, help="Checkpoint path.")
     parser.add_argument("--mesh", required=True, help="Path to mesh file (OBJ/PLY).")
+    parser.add_argument("--uv_bundle", default="", type=str,
+                        help="Load a precomputed UV bundle (uv_cache + neural_rgb/appear_embed).")
     parser.add_argument("--color_mode", choices=["uv", "vertex"], default="uv",
                         help="Mesh color source: uv (neural texture) or vertex (PLY colors).")
     parser.add_argument("--sanitize_mesh", action="store_true",
@@ -55,6 +57,14 @@ def parse_args():
                         help="Texel padding iterations for UV texture (0 to disable).")
     parser.add_argument("--uv_raster", choices=["gpu", "cpu"], default="gpu",
                         help="Rasterization backend for UV cache.")
+    parser.add_argument("--uv_project_to_surface", action="store_true",
+                        help="Project UV texels to the SDF=0 surface before caching.")
+    parser.add_argument("--uv_project_iters", default=1, type=int,
+                        help="Projection iterations when uv_project_to_surface is enabled.")
+    parser.add_argument("--uv_project_step", default=1.0, type=float,
+                        help="Projection step scale when uv_project_to_surface is enabled.")
+    parser.add_argument("--uv_project_max_step", default=0.0, type=float,
+                        help="Clamp per-iter projection step length (0 to disable).")
     parser.add_argument("--mesh_space", choices=["world", "normalized"], default="world",
                         help="Mesh coordinate space (world or normalized).")
     parser.add_argument("--appear_idx", default=None, type=int,
@@ -70,6 +80,8 @@ def parse_args():
                         help="Disable screen-space Y flip.")
     parser.add_argument("--debug_dir", default="", type=str,
                         help="Output directory for debug renders (empty to disable).")
+    parser.add_argument("--psnr_log", default="", type=str,
+                        help="Optional file path to append final Average PSNR line.")
     parser.add_argument("--debug_every", default=0, type=int,
                         help="Save debug images every N views (0 to disable).")
     parser.add_argument("--debug_max_views", default=20, type=int,
@@ -430,15 +442,25 @@ def main():
     cfg.logdir = ''
 
     trainer = None
+    neural_rgb = None
+    appear_embed = None
+    uv_cache = None
+    bundle_meta = None
     if args.color_mode == "uv":
-        trainer = get_trainer(cfg, is_inference=True, seed=0)
-        trainer.checkpointer.load(args.checkpoint, load_opt=False, load_sch=False)
-        trainer.model.eval()
-        trainer.current_iteration = trainer.checkpointer.eval_iteration
-        if cfg.model.object.sdf.encoding.coarse2fine.enabled:
-            trainer.model_module.neural_sdf.set_active_levels(trainer.current_iteration)
-            if cfg.model.object.sdf.gradient.mode == "numerical":
-                trainer.model_module.neural_sdf.set_normal_epsilon()
+        if args.uv_bundle:
+            device = torch.device(f"cuda:{int(args.local_rank)}" if torch.cuda.is_available() else "cpu")
+            uv_cache, neural_rgb, appear_embed, bundle_meta = load_uv_bundle(args.uv_bundle, device=device)
+        else:
+            if not args.checkpoint:
+                raise ValueError("--checkpoint is required when --uv_bundle is not provided.")
+            trainer = get_trainer(cfg, is_inference=True, seed=0)
+            trainer.checkpointer.load(args.checkpoint, load_opt=False, load_sch=False)
+            trainer.model.eval()
+            trainer.current_iteration = trainer.checkpointer.eval_iteration
+            if cfg.model.object.sdf.encoding.coarse2fine.enabled:
+                trainer.model_module.neural_sdf.set_active_levels(trainer.current_iteration)
+                if cfg.model.object.sdf.gradient.mode == "numerical":
+                    trainer.model_module.neural_sdf.set_normal_epsilon()
     else:
         if not torch.cuda.is_available():
             raise RuntimeError("Vertex color rendering requires CUDA (nvdiffrast).")
@@ -459,6 +481,12 @@ def main():
             raise ValueError("Input mesh does not contain per-vertex colors.")
 
     scene_center, scene_radius = _get_scene_normalization(cfg, meta)
+    if args.color_mode == "uv" and args.uv_bundle and bundle_meta is not None:
+        bundle_center = bundle_meta.get("sphere_center")
+        bundle_radius = bundle_meta.get("sphere_radius")
+        if bundle_center is not None and bundle_radius is not None:
+            scene_center = np.asarray(bundle_center, dtype=np.float32)
+            scene_radius = float(bundle_radius)
     if args.mesh_space == "world":
         sphere_center = scene_center
         sphere_radius = scene_radius
@@ -470,15 +498,22 @@ def main():
 
     faces = np.asarray(mesh.faces, dtype=np.int32)
     if args.color_mode == "uv":
-        uv_cache = build_uv_cache(
-            mesh,
-            trainer.model_module.neural_sdf,
-            sphere_center=sphere_center,
-            sphere_radius=sphere_radius,
-            texture_size=args.texture_size,
-            raster_mode=args.uv_raster,
-            batch_size=args.batch_size,
-        )
+        if uv_cache is None:
+            uv_cache = build_uv_cache(
+                mesh,
+                trainer.model_module.neural_sdf,
+                sphere_center=sphere_center,
+                sphere_radius=sphere_radius,
+                texture_size=args.texture_size,
+                raster_mode=args.uv_raster,
+                batch_size=args.batch_size,
+                project_to_surface=args.uv_project_to_surface,
+                project_iters=args.uv_project_iters,
+                project_step=args.uv_project_step,
+                project_max_step=args.uv_project_max_step,
+            )
+            neural_rgb = trainer.model_module.neural_rgb
+            appear_embed = trainer.model_module.appear_embed
         pad_mask = _build_uv_mask(uv_cache) if args.uv_padding > 0 else None
         uvs = np.asarray(mesh.visual.uv, dtype=np.float32)
         if uvs.shape[0] != vertices_norm.shape[0]:
@@ -499,6 +534,7 @@ def main():
     if get_world_size() > 1:
         indices = indices[get_rank()::get_world_size()]
 
+    debug_dir_root = args.debug_dir
     debug_dir = args.debug_dir
     debug_every = int(args.debug_every)
     debug_max_views = int(args.debug_max_views)
@@ -532,8 +568,8 @@ def main():
                 appear_idx = int(args.appear_idx)
             texture = render_view_dependent_texture(
                 uv_cache=uv_cache,
-                neural_rgb=trainer.model_module.neural_rgb,
-                appear_embed=trainer.model_module.appear_embed,
+                neural_rgb=neural_rgb,
+                appear_embed=appear_embed,
                 cam_pos_world=cam_pos_world,
                 sphere_center=sphere_center,
                 sphere_radius=sphere_radius,
@@ -594,7 +630,17 @@ def main():
     if is_master():
         denom = max(count_tensor.item(), 1.0)
         avg_psnr = (psnr_tensor / denom).item()
-        print(f"Average PSNR ({args.split}): {avg_psnr:.4f} over {int(denom)} views.")
+        summary_line = f"Average PSNR ({args.split}): {avg_psnr:.4f} over {int(denom)} views."
+        print(summary_line)
+        psnr_log = args.psnr_log
+        if not psnr_log and debug_dir_root:
+            psnr_log = os.path.join(debug_dir_root, "psnr.txt")
+        if psnr_log:
+            log_dir = os.path.dirname(psnr_log)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            with open(psnr_log, "a", encoding="utf-8") as f:
+                f.write(summary_line + "\n")
 
 
 if __name__ == "__main__":

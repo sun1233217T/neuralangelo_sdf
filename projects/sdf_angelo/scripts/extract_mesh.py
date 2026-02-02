@@ -21,11 +21,13 @@ python projects/sdf_angelo/scripts/extract_mesh.py --single_gpu\
 
 import argparse
 import json
+import math
 import os
 import sys
 import numpy as np
 import trimesh
 import torch
+import torch.nn.functional as F
 from functools import partial
 from PIL import Image
 
@@ -70,13 +72,17 @@ def parse_args():
     parser.add_argument("--uv_raster", choices=["gpu", "cpu"], default="gpu",
                         help="Rasterization backend for UV bake")
     parser.add_argument("--uv_remesh", action="store_true",
-                        help="Apply isotropic remesh with pymeshlab during UV preprocess")
+                        help="Apply remesh during UV preprocess")
     parser.add_argument("--uv_remesh_target_len", default=0.0, type=float,
-                        help="Target edge length for isotropic remesh (0 to auto)")
+                        help="Target edge length (pymeshlab) or voxel size (open3d) for UV remesh (0 to auto)")
     parser.add_argument("--uv_remesh_iters", default=10, type=int,
                         help="Iterations for isotropic remesh")
     parser.add_argument("--uv_remesh_position", choices=["before", "after"], default="after",
                         help="Run remesh before or after final target-face simplification")
+    parser.add_argument("--uv_remesh_mode", choices=["pymeshlab", "open3d_voxel"], default="pymeshlab",
+                        help="Remesh backend for UV preprocess")
+    parser.add_argument("--uv_weld_tol", default=0.0, type=float,
+                        help="Weld near-coincident vertices before UV preprocess (0 to disable).")
     parser.add_argument("--simplify_only", action="store_true",
                         help="Export simplified mesh without UV baking")
     parser.add_argument("--skip_uv_preprocess", action="store_true",
@@ -95,6 +101,20 @@ def parse_args():
                         help="Alpha threshold in [0,1] for RGBA visibility mask.")
     parser.add_argument("--depth_visible", action="store_true",
                         help="Use GPU rasterization for depth visibility (requires nvdiffrast).")
+    parser.add_argument("--depth_percentile", default=99.0, type=float,
+                        help="Percentile (0-100 or 0-1). If any depth percentile/trim value > 1, all are treated as percentages.")
+    parser.add_argument("--depth_trim_low", default=1.0, type=float,
+                        help="Lower percentile (0-100 or 0-1). If any depth percentile/trim value > 1, all are treated as percentages.")
+    parser.add_argument("--depth_trim_high", default=99.0, type=float,
+                        help="Upper percentile (0-100 or 0-1). If any depth percentile/trim value > 1, all are treated as percentages.")
+    parser.add_argument("--depth_smooth_kernel", default=3, type=int,
+                        help="Odd kernel size for masked depth smoothing (1 to disable).")
+    parser.add_argument("--depth_margin_ratio", default=0.05, type=float,
+                        help="Margin ratio (relative to base depth) for --depth_visible.")
+    parser.add_argument("--depth_margin_stat", choices=["mean", "median"], default="median",
+                        help="Statistic used as base depth for margin in --depth_visible.")
+    parser.add_argument("--depth_face_mode", choices=["any", "all"], default="all",
+                        help="Keep faces if any/all vertices pass depth cap per view in --depth_visible.")
     args, cfg_cmd = parser.parse_known_args()
     return args, cfg_cmd
 
@@ -136,7 +156,38 @@ def _load_alpha_mask(image_path, alpha_threshold):
     return mask, image.size
 
 
-def _filter_mesh_visibility(mesh, meta, cfg, alpha_threshold=0.5, device=None, depth_visible=False):
+def _normalize_percentiles(percentile, trim_low, trim_high):
+    values = [float(percentile), float(trim_low), float(trim_high)]
+    if any(v < 0.0 for v in values):
+        raise ValueError("Depth percentiles must be non-negative.")
+    if any(v > 1.0 for v in values):
+        values = [v / 100.0 for v in values]
+    if any(v > 1.0 for v in values):
+        raise ValueError("Depth percentiles must be in [0,1] or [0,100].")
+    return values[0], values[1], values[2]
+
+
+def _compute_depth_threshold(depth_vals, q):
+    if depth_vals.numel() == 0:
+        return None
+    if not (0.0 <= q <= 1.0):
+        raise ValueError("Normalized percentile must be in [0,1].")
+    if q <= 0.0:
+        return depth_vals.min().item()
+    if q >= 1.0:
+        return depth_vals.max().item()
+    try:
+        return torch.quantile(depth_vals, q).item()
+    except (AttributeError, RuntimeError):
+        k = int(math.ceil(q * depth_vals.numel()))
+        k = max(1, min(depth_vals.numel(), k))
+        return depth_vals.kthvalue(k).values.item()
+
+
+def _filter_mesh_visibility(mesh, meta, cfg, alpha_threshold=0.5, device=None, depth_visible=False,
+                            depth_percentile=99.0, depth_trim_low=1.0, depth_trim_high=99.0,
+                            depth_smooth_kernel=3, depth_margin_ratio=0.05,
+                            depth_margin_stat="median", depth_face_mode="all"):
     if mesh is None or len(mesh.vertices) == 0:
         return mesh
     if not (0.0 <= alpha_threshold <= 1.0):
@@ -144,7 +195,10 @@ def _filter_mesh_visibility(mesh, meta, cfg, alpha_threshold=0.5, device=None, d
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if depth_visible:
-        return _filter_mesh_visibility_depth(mesh, meta, cfg, alpha_threshold, device)
+        return _filter_mesh_visibility_depth(mesh, meta, cfg, alpha_threshold, device,
+                                             depth_percentile, depth_trim_low, depth_trim_high,
+                                             depth_smooth_kernel, depth_margin_ratio,
+                                             depth_margin_stat, depth_face_mode)
 
     intr_base, meta_w, meta_h = _build_intrinsics(meta)
     center = np.array(meta.get("sphere_center", [0.0, 0.0, 0.0]), dtype=np.float32)
@@ -220,11 +274,24 @@ def _filter_mesh_visibility(mesh, meta, cfg, alpha_threshold=0.5, device=None, d
     return mesh
 
 
-def _filter_mesh_visibility_depth(mesh, meta, cfg, alpha_threshold=0.5, device=None):
+def _filter_mesh_visibility_depth(mesh, meta, cfg, alpha_threshold=0.5, device=None,
+                                  depth_percentile=99.0, depth_trim_low=1.0, depth_trim_high=99.0,
+                                  depth_smooth_kernel=3, depth_margin_ratio=0.05,
+                                  depth_margin_stat="median", depth_face_mode="all"):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         raise RuntimeError("depth_visible requires a CUDA device.")
+    if depth_margin_ratio < 0:
+        raise ValueError("depth_margin_ratio must be >= 0.")
+    if depth_smooth_kernel < 1:
+        raise ValueError("depth_smooth_kernel must be >= 1.")
+    if depth_smooth_kernel % 2 == 0:
+        raise ValueError("depth_smooth_kernel must be odd.")
+
+    depth_q, trim_low, trim_high = _normalize_percentiles(depth_percentile, depth_trim_low, depth_trim_high)
+    if trim_low > trim_high:
+        raise ValueError("depth_trim_low must be <= depth_trim_high.")
 
     dr = _get_nvdiffrast()
     ctx = dr.RasterizeCudaContext()
@@ -242,13 +309,14 @@ def _filter_mesh_visibility_depth(mesh, meta, cfg, alpha_threshold=0.5, device=N
     faces = np.asarray(mesh.faces, dtype=np.int32)
     verts_t = torch.from_numpy(vertices).to(device=device, dtype=torch.float32)
     tri = torch.from_numpy(faces).to(device=device, dtype=torch.int32)
+    tri_long = tri.to(dtype=torch.int64)
     visible_faces = torch.zeros((faces.shape[0],), dtype=torch.bool, device=device)
     frames = meta.get("frames", [])
     if len(frames) == 0:
         print("No frames found in transforms.json; skipping visibility filter.")
         return mesh
 
-    print(f"Filtering mesh visibility (depth) using {len(frames)} frames...")
+    print(f"Filtering mesh by depth cap using {len(frames)} frames...")
     for frame in frames:
         image_path = os.path.join(cfg.data.root, frame["file_path"])
         alpha_mask, image_size = _load_alpha_mask(image_path, alpha_threshold)
@@ -296,19 +364,72 @@ def _filter_mesh_visibility_depth(mesh, meta, cfg, alpha_threshold=0.5, device=N
             pos[0, invalid, 0:3] = 2.0
 
         rast, _ = dr.rasterize(ctx, pos, tri, resolution=[img_h, img_w])
+        rast = rast.contiguous()
         tri_id = rast[..., 3]
         if tri_id.min().item() < 0:
-            mask = tri_id >= 0
-            tri_idx = tri_id.to(torch.int64)
+            pix_valid = tri_id >= 0
         else:
-            mask = tri_id > 0
-            tri_idx = tri_id.to(torch.int64) - 1
+            pix_valid = tri_id > 0
         alpha_t = torch.from_numpy(alpha_mask).to(device=device)
-        mask = mask & alpha_t.unsqueeze(0)
-        if not mask.any():
+        pix_valid = pix_valid & alpha_t.unsqueeze(0)
+        if not pix_valid.any():
             continue
-        tri_visible = tri_idx[mask]
-        visible_faces[tri_visible] = True
+
+        z_attr = z.contiguous().view(1, -1, 1).contiguous()
+        depth_map, _ = dr.interpolate(z_attr, rast, tri.contiguous())
+        depth_map = depth_map[..., 0]
+        depth_2d = depth_map[0]
+        mask_2d = pix_valid[0]
+        if depth_smooth_kernel > 1:
+            depth_in = (depth_2d * mask_2d).unsqueeze(0).unsqueeze(0)
+            mask_in = mask_2d.to(dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            depth_blur = F.avg_pool2d(depth_in, depth_smooth_kernel, stride=1,
+                                      padding=depth_smooth_kernel // 2)
+            mask_blur = F.avg_pool2d(mask_in, depth_smooth_kernel, stride=1,
+                                     padding=depth_smooth_kernel // 2)
+            depth_2d = (depth_blur / (mask_blur + 1e-6))[0, 0]
+        depth_vals = depth_2d[mask_2d]
+        if depth_vals.numel() == 0:
+            continue
+        depth_vals = depth_vals[torch.isfinite(depth_vals)]
+        if depth_vals.numel() == 0:
+            continue
+        if trim_low > 0.0 or trim_high < 1.0:
+            low_v = _compute_depth_threshold(depth_vals, trim_low)
+            high_v = _compute_depth_threshold(depth_vals, trim_high)
+            if low_v is not None and high_v is not None and low_v <= high_v:
+                trimmed = depth_vals[(depth_vals >= low_v) & (depth_vals <= high_v)]
+                if trimmed.numel() > 0:
+                    depth_vals = trimmed
+        depth_cap = _compute_depth_threshold(depth_vals, depth_q)
+        if depth_cap is None:
+            continue
+        if depth_margin_stat == "median":
+            base_depth = depth_vals.median().item()
+        else:
+            base_depth = depth_vals.mean().item()
+        depth_limit = depth_cap + base_depth * depth_margin_ratio
+
+        x_int = torch.round(u).to(dtype=torch.int64)
+        y_int = torch.round(v).to(dtype=torch.int64)
+        inside = (x_int >= 0) & (x_int < img_w) & (y_int >= 0) & (y_int < img_h) & valid_z
+        if not inside.any():
+            continue
+        inside_idx = torch.nonzero(inside, as_tuple=False).squeeze(1)
+        alpha_ok = alpha_t[y_int[inside_idx], x_int[inside_idx]]
+        depth_ok = z[inside_idx] <= depth_limit
+        keep = alpha_ok & depth_ok
+        if not keep.any():
+            continue
+        vertex_visible = torch.zeros((verts_t.shape[0],), dtype=torch.bool, device=device)
+        vertex_visible[inside_idx[keep]] = True
+
+        if depth_face_mode == "all":
+            face_mask = vertex_visible[tri_long].all(dim=1)
+        else:
+            face_mask = vertex_visible[tri_long].any(dim=1)
+        if face_mask.any():
+            visible_faces[face_mask] = True
         if visible_faces.all():
             break
 
@@ -412,6 +533,13 @@ def main():
                 alpha_threshold=args.alpha_threshold,
                 device=next(trainer.model_module.neural_sdf.parameters()).device,
                 depth_visible=args.depth_visible,
+                depth_percentile=args.depth_percentile,
+                depth_trim_low=args.depth_trim_low,
+                depth_trim_high=args.depth_trim_high,
+                depth_smooth_kernel=args.depth_smooth_kernel,
+                depth_margin_ratio=args.depth_margin_ratio,
+                depth_margin_stat=args.depth_margin_stat,
+                depth_face_mode=args.depth_face_mode,
             )
         if args.simplify_only:
             if args.uv_textured:
@@ -428,26 +556,30 @@ def main():
                     remesh_target_len=args.uv_remesh_target_len,
                     remesh_iters=args.uv_remesh_iters,
                     remesh_position=args.uv_remesh_position,
+                    remesh_mode=args.uv_remesh_mode,
+                    weld_tol=args.uv_weld_tol,
                 )
         elif args.uv_textured:
-            mesh = bake_uv_texture(
-                mesh,
-                neural_rgb=trainer.model_module.neural_rgb,
-                neural_sdf=trainer.model_module.neural_sdf,
-                appear_embed=trainer.model_module.appear_embed,
-                texture_size=args.texture_size,
-                batch_size=args.bake_batch,
-                pad_iters=args.uv_padding,
-                target_faces=args.uv_target_faces,
-                max_faces=args.uv_max_faces,
-                keep_lcc=not args.uv_no_lcc,
-                raster_mode=args.uv_raster,
-                preprocess=not args.skip_uv_preprocess,
-                remesh=args.uv_remesh,
-                remesh_target_len=args.uv_remesh_target_len,
-                remesh_iters=args.uv_remesh_iters,
-                remesh_position=args.uv_remesh_position,
-            )
+                mesh = bake_uv_texture(
+                    mesh,
+                    neural_rgb=trainer.model_module.neural_rgb,
+                    neural_sdf=trainer.model_module.neural_sdf,
+                    appear_embed=trainer.model_module.appear_embed,
+                    texture_size=args.texture_size,
+                    batch_size=args.bake_batch,
+                    pad_iters=args.uv_padding,
+                    target_faces=args.uv_target_faces,
+                    max_faces=args.uv_max_faces,
+                    keep_lcc=not args.uv_no_lcc,
+                    raster_mode=args.uv_raster,
+                    preprocess=not args.skip_uv_preprocess,
+                    remesh=args.uv_remesh,
+                    remesh_target_len=args.uv_remesh_target_len,
+                    remesh_iters=args.uv_remesh_iters,
+                    remesh_position=args.uv_remesh_position,
+                    remesh_mode=args.uv_remesh_mode,
+                    weld_tol=args.uv_weld_tol,
+                )
         print(f"vertices: {len(mesh.vertices)}")
         print(f"faces: {len(mesh.faces)}")
         if args.textured and not args.uv_textured and not args.simplify_only and not args.input_mesh:

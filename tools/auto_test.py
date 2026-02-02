@@ -21,8 +21,12 @@ from pathlib import Path
 
 DEFAULT_RESOLUTION = 2048
 DEFAULT_BLOCK_RES = 128
+DEFAULT_UV_TEXTURE_SIZE = 4096
+DEFAULT_UV_TARGET_FACES = 50000
+DEFAULT_UV_WELD_TOL = 1e-4
 EXTRACT_SCRIPT = "projects/sdf_angelo/scripts/extract_mesh.py"
 EVAL_SCRIPT = "projects/sdf_angelo/scripts/eval_DTU_mesh.py"
+UV_EVAL_SCRIPT = "projects/sdf_angelo/scripts/uv_mesh_psnr.py"
 
 def _quote(value):
     return shlex.quote(str(value))
@@ -74,7 +78,9 @@ def generate_cmds(
         #     continue
         output_dir_path = Path(output_dir)
         visible_mesh = output_dir_path / f"{tmp_name}_vis.obj"
-        output_mesh = output_dir_path / f"{tmp_name}_eval.ply"
+        output_mesh = output_dir_path / f"{tmp_name}_eval.obj"
+        uv_mesh = output_dir_path / f"{tmp_name}_eval_uv.obj"
+        uv_debug_dir = output_dir_path / f"{tmp_name}_uv_debug"
         scale_mat_path = Path(scale_mat_root) / f"scan{scanid}/cameras.npz"
         transforms_json = Path(transforms_root) / f"scan{scanid}/transforms.json"
 
@@ -104,6 +110,12 @@ def generate_cmds(
             "--input_mesh_space=world",
             f"--input_mesh={_quote(visible_mesh)}",
             "--depth_visible",
+            "--depth_percentile=95",
+            "--depth_trim_low=1",
+            "--depth_trim_high=99",
+            "--depth_smooth_kernel=3",
+            "--depth_margin_stat=median",
+            "--depth_margin_ratio=0.01",
         ]
         if data_root:
             cmd2_parts.append(f"--data.root={_quote(Path(data_root) / f'scan{scanid}')}")  # override config
@@ -133,11 +145,61 @@ def generate_cmds(
                 "--apply_scale_mat",
                 f"--scale_mat_path={_quote(scale_mat_path)}",
             ])
+        cmd4_parts = [
+            gpu_prefix,
+            "python",
+            EXTRACT_SCRIPT,
+            "--single_gpu",
+            f"--config={_quote(config_path)}",
+            f"--checkpoint={_quote(last_ckpt)}",
+            f"--input_mesh={_quote(output_mesh)}",
+            "--input_mesh_space=world",
+            f"--output_file={_quote(uv_mesh)}",
+            "--uv_textured",
+            "--uv_raster=gpu",
+            f"--texture_size={DEFAULT_UV_TEXTURE_SIZE}",
+            f"--uv_target_faces={DEFAULT_UV_TARGET_FACES}",
+            "--uv_remesh",
+            "--uv_remesh_position=after",
+            "--uv_no_lcc",
+            f"--uv_weld_tol={DEFAULT_UV_WELD_TOL}",
+        ]
+        if data_root:
+            cmd4_parts.append(f"--data.root={_quote(Path(data_root) / f'scan{scanid}')}")  # override config
+        cmd5_parts = [
+            gpu_prefix,
+            "python",
+            UV_EVAL_SCRIPT,
+            "--single_gpu",
+            f"--config={_quote(config_path)}",
+            f"--checkpoint={_quote(last_ckpt)}",
+            f"--mesh={_quote(uv_mesh)}",
+            "--color_mode=uv",
+            "--no_flip_y",
+            "--split train",
+            "--ignore_alpha",
+            "--uv_project_to_surface",
+            "--uv_project_iters 1",
+            "--uv_project_step 1.0",
+            "--uv_project_max_step 0.0",
+            "--texture_size 2048",
+            "--mesh_space=world",
+            f"--texture_size={DEFAULT_UV_TEXTURE_SIZE}",
+            "--uv_raster=gpu",
+            f"--debug_dir={_quote(uv_debug_dir)}",
+            "--debug_every=10",
+            "--debug_max_views=20",
+        ]
+
+        if data_root:
+            cmd5_parts.append(f"--data.root={_quote(Path(data_root) / f'scan{scanid}')}")  # override config
         cmds.append(
             [
-                " ".join(part for part in cmd1_parts if part),
+                # " ".join(part for part in cmd1_parts if part),
                 " ".join(part for part in cmd2_parts if part),
-                " ".join(part for part in cmd3_parts if part),
+                # " ".join(part for part in cmd3_parts if part),
+                " ".join(part for part in cmd4_parts if part),
+                " ".join(part for part in cmd5_parts if part),
             ]
         )
 
@@ -153,7 +215,8 @@ def run_cmds(cmds):
 def print_cmds(cmds):
     for cmd in cmds:
         for c in cmd:
-            print(c)
+            print(c,end='\n\n')
+        print('--------------------------------------------------------------------')
 
 
 def main():

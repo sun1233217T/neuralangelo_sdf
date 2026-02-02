@@ -393,6 +393,34 @@ def _simplify_with_open3d(mesh, target_faces):
         return None
 
 
+def _weld_vertices(mesh, tol):
+    if tol <= 0:
+        return mesh
+    vertices = np.asarray(mesh.vertices)
+    faces = np.asarray(mesh.faces)
+    if vertices.size == 0 or faces.size == 0:
+        return mesh
+    scale = 1.0 / float(tol)
+    keys = np.round(vertices * scale).astype(np.int64)
+    key_view = np.ascontiguousarray(keys).view([("", keys.dtype)] * 3)
+    _, inverse = np.unique(key_view, return_inverse=True)
+    inverse = np.asarray(inverse).reshape(-1)
+    counts = np.bincount(inverse.astype(np.int64))
+    if counts.size == 0:
+        return mesh
+    new_vertices = np.zeros((counts.size, 3), dtype=vertices.dtype)
+    for dim in range(3):
+        new_vertices[:, dim] = np.bincount(inverse, weights=vertices[:, dim]) / counts
+    new_faces = inverse[faces]
+    mask = (new_faces[:, 0] != new_faces[:, 1]) & (new_faces[:, 0] != new_faces[:, 2]) & (new_faces[:, 1] != new_faces[:, 2])
+    new_faces = new_faces[mask]
+    if new_faces.size == 0:
+        print("Vertex weld produced empty mesh; keeping original.")
+        return mesh
+    print(f"Vertex weld done. Vertices: {len(new_vertices)} faces: {len(new_faces)}")
+    return trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
+
+
 def _estimate_remesh_target_len(mesh, target_faces=None):
     if target_faces is not None and target_faces > 0:
         area = float(getattr(mesh, "area", 0.0))
@@ -439,9 +467,51 @@ def _isotropic_remesh_pymeshlab(mesh, target_len, iterations=10):
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
+def _voxel_remesh_open3d(mesh, voxel_size):
+    try:
+        import open3d as o3d  # type: ignore
+    except Exception as exc:
+        print(f"Open3D not available for voxel remesh: {exc}")
+        return mesh
+    if voxel_size <= 0:
+        print("Invalid voxel size; skipping Open3D voxel remesh.")
+        return mesh
+    try:
+        tri = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(mesh.vertices),
+            o3d.utility.Vector3iVector(mesh.faces),
+        )
+        tri.remove_degenerate_triangles()
+        tri.remove_duplicated_triangles()
+        tri.remove_duplicated_vertices()
+        tri.remove_non_manifold_edges()
+        simplified = tri.simplify_vertex_clustering(
+            voxel_size=float(voxel_size),
+            contraction=o3d.geometry.SimplificationContraction.Average,
+        )
+        simplified.remove_degenerate_triangles()
+        simplified.remove_duplicated_triangles()
+        simplified.remove_duplicated_vertices()
+        simplified.remove_non_manifold_edges()
+        vertices = np.asarray(simplified.vertices)
+        faces = np.asarray(simplified.triangles)
+    except Exception as exc:
+        print(f"Open3D voxel remesh failed: {exc}")
+        return mesh
+    if vertices.size == 0 or faces.size == 0:
+        print("Open3D voxel remesh produced empty mesh; keeping original.")
+        return mesh
+    print(f"Open3D voxel remesh done. Faces: {len(faces)}")
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
 def prepare_mesh_for_uv(mesh, target_faces=None, max_faces=None, keep_lcc=True,
                         remesh=False, remesh_target_len=0.0, remesh_iters=10,
-                        remesh_position="after"):
+                        remesh_position="after", remesh_mode="pymeshlab",
+                        weld_tol=0.0):
+    if weld_tol > 0:
+        print(f"Welding vertices with tol={weld_tol:.6f}")
+        mesh = _weld_vertices(mesh, tol=weld_tol)
     face_count = len(mesh.faces)
     if max_faces is not None and max_faces > 0 and face_count > max_faces:
         print(f"Pre-simplifying mesh to {max_faces} faces.")
@@ -453,8 +523,12 @@ def prepare_mesh_for_uv(mesh, target_faces=None, max_faces=None, keep_lcc=True,
         target_len = remesh_target_len
         if target_len <= 0:
             target_len = _estimate_remesh_target_len(mesh, target_faces=target_faces)
-        print(f"Isotropic remesh before final simplify. target_len={target_len:.6f}")
-        mesh = _isotropic_remesh_pymeshlab(mesh, target_len=target_len, iterations=remesh_iters)
+        if remesh_mode == "open3d_voxel":
+            print(f"Open3D voxel remesh before final simplify. voxel_size={target_len:.6f}")
+            mesh = _voxel_remesh_open3d(mesh, voxel_size=target_len)
+        else:
+            print(f"Isotropic remesh before final simplify. target_len={target_len:.6f}")
+            mesh = _isotropic_remesh_pymeshlab(mesh, target_len=target_len, iterations=remesh_iters)
     if target_faces is not None and target_faces > 0 and len(mesh.faces) > target_faces:
         print(f"Final simplifying mesh to {target_faces} faces.")
         mesh = _simplify_mesh_for_uv(mesh, target_faces=target_faces, max_faces=None)
@@ -462,14 +536,19 @@ def prepare_mesh_for_uv(mesh, target_faces=None, max_faces=None, keep_lcc=True,
         target_len = remesh_target_len
         if target_len <= 0:
             target_len = _estimate_remesh_target_len(mesh, target_faces=target_faces)
-        print(f"Isotropic remesh after final simplify. target_len={target_len:.6f}")
-        mesh = _isotropic_remesh_pymeshlab(mesh, target_len=target_len, iterations=remesh_iters)
+        if remesh_mode == "open3d_voxel":
+            print(f"Open3D voxel remesh after final simplify. voxel_size={target_len:.6f}")
+            mesh = _voxel_remesh_open3d(mesh, voxel_size=target_len)
+        else:
+            print(f"Isotropic remesh after final simplify. target_len={target_len:.6f}")
+            mesh = _isotropic_remesh_pymeshlab(mesh, target_len=target_len, iterations=remesh_iters)
     return mesh
 
 
 def bake_uv_texture(mesh, neural_rgb, neural_sdf, appear_embed, texture_size=2048, batch_size=65536,
                     target_faces=None, max_faces=None, keep_lcc=True, raster_mode="gpu", preprocess=True,
                     remesh=False, remesh_target_len=0.0, remesh_iters=10, remesh_position="after",
+                    remesh_mode="pymeshlab", weld_tol=0.0,
                     pad_iters=0):
     if preprocess:
         mesh = prepare_mesh_for_uv(
@@ -481,6 +560,8 @@ def bake_uv_texture(mesh, neural_rgb, neural_sdf, appear_embed, texture_size=204
             remesh_target_len=remesh_target_len,
             remesh_iters=remesh_iters,
             remesh_position=remesh_position,
+            remesh_mode=remesh_mode,
+            weld_tol=weld_tol,
         )
     else:
         print("Skipping UV preprocess; using mesh as-is.")
