@@ -186,7 +186,11 @@ def _build_dataset(cfg, split):
 
 def _load_full_sample(dataset, idx, ignore_alpha=False):
     image, image_size_raw = dataset.images[idx] if dataset.preload else dataset.get_image(idx)
-    image, alpha = dataset.preprocess_image(image)
+    try:
+        image, alpha = dataset.preprocess_image(image)
+    except:
+        image = dataset.preprocess_image(image)
+        alpha = None
     intr, pose = dataset.cameras[idx] if dataset.preload else dataset.get_camera(idx)
     intr, pose = dataset.preprocess_camera(intr, pose, image_size_raw)
     if alpha is not None and not ignore_alpha:

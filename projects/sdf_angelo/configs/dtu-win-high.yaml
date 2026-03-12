@@ -1,0 +1,42 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+# -----------------------------------------------------------------------------
+
+_parent_: projects/sdf_angelo/configs/dtu-win.yaml
+
+# More conservative (higher-quality) training setup.
+max_iter: 300000
+validation_iter: 5000
+
+model:
+    render:
+        rand_rays: 1024
+        num_samples:
+            coarse: 64
+            fine: 16
+            background: 32
+        num_sample_hierarchy: 4
+
+optim:
+    params:
+        lr: 1e-3
+    sched:
+        warm_up_end: 5000
+        two_steps: [200000,260000]
+        gamma: 10.0
+
+trainer:
+    loss_weight:
+        render: 1.0
+        eikonal: 0.05
+        curvature: 2.5e-4
+        sdf_render: 1.0
+        pc_sdf: 1.0
+        opacity: 0.005
+        nerf_depth_to_sdf: 0.005

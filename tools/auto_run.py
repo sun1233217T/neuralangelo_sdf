@@ -8,6 +8,8 @@ from mtools import logger_system as logger
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRAIN_PY = os.path.join(PROJECT_ROOT, "train.py")
+BASE_MODEL = "sdf_angelo"
+BASE_MODEL = "neuralangelo"
 
 # User config.
 # DATA_ROOT = "/home/haochen/data/mip360"
@@ -18,10 +20,10 @@ DATA_ROOT = "/home/haochen/data/DTU"
 EXPERIMENT = "dtu"
 
 CONFIG = os.path.join(
-    PROJECT_ROOT, f"projects/sdf_angelo/configs/{EXPERIMENT}-win.yaml"
+    PROJECT_ROOT, f"projects/{BASE_MODEL}/configs/{EXPERIMENT}.yaml"
 )
-GROUP = "all_test_DTUv1"
-NAME_PREFIX = "sdf_utlfast_test"
+GROUP = "base_neuralangelo"
+NAME_PREFIX = "base_neuralangelo"
 SHOW_PBAR = True
 USE_WANDB = True
 WANDB_NAME = "test"
@@ -31,7 +33,7 @@ SINGLE_GPU = True
 SCENES = []  # e.g. ["scan36"] or ["garden"]; empty means auto-detect
 EXCLUDE_SCENES = {"Points"}
 
-EXCLUDED_GPUS = {0,1,2,3}  # GPUs to exclude from use
+EXCLUDED_GPUS = {0,5,6,7}  # GPUs to exclude from use
 
 
 def collect_scenes():

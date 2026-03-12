@@ -26,7 +26,7 @@ from projects.nerf.utils import render
 from projects.sdf_angelo.utils.misc import get_scheduler, eikonal_loss, curvature_loss, sdf_shift_loss
 from projects.sdf_angelo.scripts.read_write_model import read_points3D_binary, read_points3D_text
 
-from mtools import debug
+from mtools import debug, debug_after_n_iters
 
 
 class Trainer(BaseTrainer):
@@ -158,10 +158,11 @@ class Trainer(BaseTrainer):
 
     def _compute_loss(self, data, mode=None):
         if mode == "train":
-            # debug()
+            alpha_mask = data["alpha_sampled"] > 0.01
+            alpha_mask = alpha_mask.repeat(1, 1, 3)  #针对大面积透明的图片，不处理会全部陷入0的rgb值，（虽然不知道为什么）
             # Compute loss only on randomly sampled rays.
-            self.losses["render"] = self.criteria["render"](data["rgb"], data["image_sampled"]) * 3  # FIXME:sumRGB?!
-            self.metrics["psnr"] = -10 * torch_F.mse_loss(data["rgb"], data["image_sampled"]).log10()
+            self.losses["render"] = self.criteria["render"](data["rgb"][alpha_mask], data["image_sampled"][alpha_mask]) * 3  # FIXME:sumRGB?!
+            self.metrics["psnr"] = -10 * torch_F.mse_loss(data["rgb"][alpha_mask], data["image_sampled"][alpha_mask]).log10()
             if "eikonal" in self.weights.keys():
                 self.losses["eikonal"] = eikonal_loss(data["gradients"], outside=data["outside"])
             if "curvature" in self.weights:
@@ -176,7 +177,6 @@ class Trainer(BaseTrainer):
                 surface_point = data["surface_point_from_nerf"]
                 sdf = self.model_module.neural_sdf.sdf(surface_point).squeeze(-1)
                 self.losses["nerf_depth_to_sdf"] = self.criteria["depth"](sdf, torch.zeros_like(sdf))
-
             if "opacity" in self.weights and "alpha_sampled" in data:
                 opacity_pred = data.get("opacity", None)
                 if opacity_pred is None and "weights" in data:

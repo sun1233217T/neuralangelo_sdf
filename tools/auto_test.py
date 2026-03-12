@@ -195,9 +195,9 @@ def generate_cmds(
             cmd5_parts.append(f"--data.root={_quote(Path(data_root) / f'scan{scanid}')}")  # override config
         cmds.append(
             [
-                # " ".join(part for part in cmd1_parts if part),
+                " ".join(part for part in cmd1_parts if part),
                 " ".join(part for part in cmd2_parts if part),
-                # " ".join(part for part in cmd3_parts if part),
+                " ".join(part for part in cmd3_parts if part),
                 " ".join(part for part in cmd4_parts if part),
                 " ".join(part for part in cmd5_parts if part),
             ]
@@ -205,11 +205,14 @@ def generate_cmds(
 
     return cmds
     
-def run_cmds(cmds):
+def run_cmds(cmds,todo_id):
     for cmd in cmds:
+        id=0
         for c in cmd:
-            print(f'Running command: {c}')
-            os.system(c)
+            id += 1
+            if id == todo_id or todo_id == 0:
+                print(f'Running command of id: {id} {c}')
+                os.system(c)
 
 
 def print_cmds(cmds):
@@ -264,6 +267,7 @@ def main():
         help='GPU id for CUDA_VISIBLE_DEVICES (e.g., 1). Omit to use default CUDA behavior.',
     )
     parser.add_argument('--run', action='store_true', help='Actually execute the generated commands.')
+    parser.add_argument('--run_the_cmd_id', type=int, default=0, help='Actually execute the generated commands of id (1-4).')
     args = parser.parse_args()
 
     transforms_root = args.transforms_root or args.scale_mat_root
@@ -282,12 +286,14 @@ def main():
         args.gpu,
         args.align_cameras,
     )
-
     if args.run:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        run_cmds(cmds)
+        run_cmds(cmds,args.run_the_cmd_id)
     else:
         print_cmds(cmds)
 
 if __name__ == '__main__':
     main()
+
+# python tools/auto_test.py --gpu 1 -l logs/all_test_DTUv2_high -g sdf_high_test2 --config projects/sdf_angelo/configs/dtu-win-high.yaml  --run
+# python tools/auto_test.py --gpu 1 -l logs/base_neuralangelo -g base_neuralangelo --config projects/neuralangelo/configs/dtu.yaml  --run
