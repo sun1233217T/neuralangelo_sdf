@@ -119,7 +119,7 @@ class Config(AttrDict):
             |\\.(?:nan|NaN|NAN))$''', re.X),
             list(u'-+0123456789.'))
         try:
-            with open(filename) as file:
+            with open(filename, "r", encoding="utf-8") as file:
                 cfg_dict = yaml.load(file, Loader=yaml_loader)
                 cfg_dict = AttrDict(cfg_dict)
         except EnvironmentError:
@@ -145,7 +145,7 @@ class Config(AttrDict):
     def save_config(self, logdir):
         """Save the final configuration to a yaml file."""
         cfg_fname = f"{logdir}/config.yaml"
-        with open(cfg_fname, "w") as file:
+        with open(cfg_fname, "w", encoding="utf-8") as file:
             yaml.safe_dump(self.yaml(), file, default_flow_style=False, indent=4)
 
 
