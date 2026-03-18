@@ -52,8 +52,8 @@ optim:
 
 data:
     type: projects.sdf_angelo.data
-    root: /home/sunny/data/DTU/scan24
-    # root: /home/haochen/data/DTU/scan24
+    # root: /home/sunny/data/DTU/scan24
+    root: /home/haochen/data/DTU/scan24
     train:
         image_size: [1200,1600]
         batch_size: 1

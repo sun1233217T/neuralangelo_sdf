@@ -408,7 +408,7 @@ class MeshRenderer:
         bg = self._background_tensor(background, height, width)
         color = color * mask.unsqueeze(-1) + bg.permute(1, 2, 0) * (1.0 - mask.unsqueeze(-1))
         color = color.permute(0, 3, 1, 2).contiguous()[0]
-        return color, mask.unsqueeze(0)
+        return color, mask.contiguous()
 
     def _background_tensor(self, background, height, width):
         if isinstance(background, (tuple, list, np.ndarray)):
@@ -424,6 +424,10 @@ def compute_psnr(pred, target, mask=None):
     if mask is None:
         mse = torch_F.mse_loss(pred, target)
     else:
+        while mask.ndim > pred.ndim and mask.shape[0] == 1:
+            mask = mask.squeeze(0)
+        if mask.ndim == pred.ndim - 1:
+            mask = mask.unsqueeze(0)
         mask = mask.expand_as(pred)
         denom = mask.sum().clamp_min(1.0)
         mse = ((pred - target) ** 2 * mask).sum() / denom

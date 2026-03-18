@@ -634,7 +634,14 @@ class Checkpointer(object):
         if checkpoint_path is not None:
             self._check_checkpoint_exists(checkpoint_path)
             self.checkpoint_path = checkpoint_path
-            state_dict = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+            try:
+                state_dict = torch.load(
+                    checkpoint_path,
+                    map_location=lambda storage, loc: storage,
+                    weights_only=False,
+                )
+            except TypeError:
+                state_dict = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
             print(f"Loading checkpoint (local): {checkpoint_path}")
             # Load the state dicts.
             print('- Loading the model...')
