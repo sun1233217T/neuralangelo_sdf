@@ -14,6 +14,17 @@ pip install pygame PyOpenGL PyOpenGL_accelerate
 
 The existing project dependencies are still required for model loading.
 
+## Troubleshooting
+
+- `UserWarning: pkg_resources is deprecated`: this is emitted by `pygame` internals and can be ignored.
+- `OpenGL.error.Error: Attempt to retrieve context when no valid context`:
+  the viewer now auto-falls back to raw GL pointer calls when PyOpenGL context tracking fails.
+  If your environment still has issues, try forcing X11 backend:
+
+```bash
+PYOPENGL_PLATFORM=x11 python projects/sdf_angelo/uv_viewer_light/app.py original --uv_bundle path/to/uv_bundle.pt
+```
+
 ## Controls
 
 - Left drag: trackball rotate

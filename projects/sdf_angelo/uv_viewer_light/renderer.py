@@ -6,6 +6,9 @@ import numpy as np
 class GLMeshRenderer:
 
     def __init__(self, mesh, texture_size, background=(0.08, 0.08, 0.10, 1.0)):
+        gl_vertex_pointer_raw = None
+        gl_texcoord_pointer_raw = None
+        opengl_error_cls = RuntimeError
         try:
             from OpenGL.GL import (  # pylint: disable=import-error
                 GL_ARRAY_BUFFER,
@@ -58,6 +61,18 @@ class GLMeshRenderer:
                 GL_VERTEX_ARRAY,
             )
             from OpenGL.GLU import gluLookAt, gluPerspective  # pylint: disable=import-error
+            from OpenGL import error as opengl_error  # pylint: disable=import-error
+            opengl_error_cls = getattr(opengl_error, "Error", RuntimeError)
+            try:
+                from OpenGL.raw.GL.VERSION.GL_1_1 import (  # pylint: disable=import-error
+                    glTexCoordPointer as glTexCoordPointerRaw,
+                    glVertexPointer as glVertexPointerRaw,
+                )
+                gl_vertex_pointer_raw = glVertexPointerRaw
+                gl_texcoord_pointer_raw = glTexCoordPointerRaw
+            except Exception:
+                gl_vertex_pointer_raw = None
+                gl_texcoord_pointer_raw = None
         except Exception as exc:
             raise RuntimeError(
                 "PyOpenGL is required for uv_viewer_light. Install PyOpenGL and PyOpenGL_accelerate."
@@ -71,6 +86,10 @@ class GLMeshRenderer:
         self.mesh = mesh
         self.texture_size = int(texture_size)
         self._wireframe = False
+        self._opengl_error_cls = opengl_error_cls
+        self._gl_vertex_pointer_raw = gl_vertex_pointer_raw
+        self._gl_texcoord_pointer_raw = gl_texcoord_pointer_raw
+        self._use_raw_pointer_calls = False
 
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
         faces = np.asarray(mesh.faces, dtype=np.uint32).reshape(-1)
@@ -185,6 +204,26 @@ class GLMeshRenderer:
         glBindBuffer(self._gl["GL_ELEMENT_ARRAY_BUFFER"], self._ebo)
         glEnableClientState(self._gl["GL_VERTEX_ARRAY"])
         glEnableClientState(self._gl["GL_TEXTURE_COORD_ARRAY"])
-        glVertexPointer(3, self._gl["GL_FLOAT"], self._stride, self._vertex_offset)
-        glTexCoordPointer(2, self._gl["GL_FLOAT"], self._stride, self._uv_offset)
+        if self._use_raw_pointer_calls:
+            self._gl_vertex_pointer_raw(3, self._gl["GL_FLOAT"], self._stride, self._vertex_offset)
+            self._gl_texcoord_pointer_raw(2, self._gl["GL_FLOAT"], self._stride, self._uv_offset)
+        else:
+            try:
+                glVertexPointer(3, self._gl["GL_FLOAT"], self._stride, self._vertex_offset)
+                glTexCoordPointer(2, self._gl["GL_FLOAT"], self._stride, self._uv_offset)
+            except self._opengl_error_cls as exc:
+                can_fallback = (
+                    self._gl_vertex_pointer_raw is not None
+                    and self._gl_texcoord_pointer_raw is not None
+                    and "no valid context" in str(exc).lower()
+                )
+                if not can_fallback:
+                    raise
+                self._use_raw_pointer_calls = True
+                print(
+                    "[uv_viewer_light] PyOpenGL context tracking failed in gl*Pointer; "
+                    "falling back to raw GL calls."
+                )
+                self._gl_vertex_pointer_raw(3, self._gl["GL_FLOAT"], self._stride, self._vertex_offset)
+                self._gl_texcoord_pointer_raw(2, self._gl["GL_FLOAT"], self._stride, self._uv_offset)
         glDrawElements(self._gl["GL_TRIANGLES"], self._index_count, self._gl["GL_UNSIGNED_INT"], None)
