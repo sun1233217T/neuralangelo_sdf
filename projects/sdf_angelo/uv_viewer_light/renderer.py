@@ -152,9 +152,9 @@ class GLMeshRenderer:
         width = max(int(viewport_size[0]), 1)
         height = max(int(viewport_size[1]), 1)
         aspect = float(width) / float(height)
-        right, up, forward = camera.get_basis()
+        _, up, _ = camera.get_basis()
         eye = camera.get_position()
-        center = eye + forward
+        center = camera.target
 
         glClear = self._gl["glClear"]
         glMatrixMode = self._gl["glMatrixMode"]
