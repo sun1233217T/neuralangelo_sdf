@@ -79,6 +79,7 @@ def _handle_camera_event(event, pygame, camera, viewport_size, drag_state):
     if event.type == pygame.MOUSEBUTTONDOWN:
         if event.button == 1:
             drag_state["left"] = True
+            drag_state["trackball"] = camera.project_trackball(event.pos, viewport_size)
         elif event.button in (2, 3):
             drag_state["right"] = True
         elif event.button == 4:
@@ -92,6 +93,7 @@ def _handle_camera_event(event, pygame, camera, viewport_size, drag_state):
     if event.type == pygame.MOUSEBUTTONUP:
         if event.button == 1:
             drag_state["left"] = False
+            drag_state["trackball"] = None
         elif event.button in (2, 3):
             drag_state["right"] = False
         drag_state["last_pos"] = np.array(event.pos, dtype=np.float32)
@@ -106,7 +108,13 @@ def _handle_camera_event(event, pygame, camera, viewport_size, drag_state):
         drag_state["last_pos"] = curr_pos
         changed = False
         if drag_state["left"]:
-            camera.orbit(delta[0], delta[1])
+            start_trackball = drag_state.get("trackball")
+            curr_trackball = camera.project_trackball(curr_pos, viewport_size)
+            if start_trackball is None:
+                drag_state["trackball"] = curr_trackball
+            else:
+                camera.trackball_rotate(start_trackball, curr_trackball)
+                drag_state["trackball"] = curr_trackball
             changed = True
         if drag_state["right"]:
             camera.pan(delta[0], delta[1], viewport_size)
@@ -120,26 +128,17 @@ def _handle_camera_event(event, pygame, camera, viewport_size, drag_state):
 
 def _print_controls():
     print("Controls:")
-    print("  Left drag: orbit")
+    print("  Left drag: trackball rotate")
     print("  Right or middle drag: pan")
     print("  Mouse wheel: zoom")
     print("  R: reset camera")
     print("  Tab: toggle wireframe")
+    print("  FPS/stats: window title")
     print("  Esc / Q: quit")
 
 
 def _apply_initial_camera(camera, initial_camera):
-    target = camera.target.astype(np.float32)
-    initial_camera = np.asarray(initial_camera, dtype=np.float32)
-    offset = initial_camera - target
-    distance = float(np.linalg.norm(offset))
-    if distance < 1e-6:
-        return
-    camera.distance = distance
-    camera.pitch = float(np.clip(np.arcsin(np.clip(offset[1] / distance, -1.0, 1.0)), -1.54, 1.54))
-    flat = max(np.linalg.norm(offset[[0, 2]]), 1e-8)
-    if flat > 0.0:
-        camera.yaw = float(np.arctan2(offset[0], offset[2]))
+    camera.set_from_position(initial_camera)
 
 
 def main():
@@ -181,10 +180,11 @@ def main():
     generator.start()
 
     clock = pygame.time.Clock()
-    drag_state = {"left": False, "right": False, "last_pos": None}
+    drag_state = {"left": False, "right": False, "last_pos": None, "trackball": None}
     last_caption = 0.0
     last_update_seen = -1
     running = True
+    reset_camera = np.asarray(runtime.initial_camera, dtype=np.float32)
     try:
         while running:
             camera_changed = False
@@ -202,6 +202,7 @@ def main():
                         continue
                     if event.key == pygame.K_r:
                         camera.reset_from_bounds(mesh.bounds)
+                        _apply_initial_camera(camera, reset_camera)
                         camera_changed = True
                         continue
                     if event.key == pygame.K_TAB:

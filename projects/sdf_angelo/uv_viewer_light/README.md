@@ -16,11 +16,12 @@ The existing project dependencies are still required for model loading.
 
 ## Controls
 
-- Left drag: orbit
+- Left drag: trackball rotate
 - Right or middle drag: pan
 - Mouse wheel: zoom
 - `R`: reset camera
 - `Tab`: toggle wireframe
+- FPS and texture update stats: window title
 - `Esc` / `Q`: quit
 
 ## Original Runtime
