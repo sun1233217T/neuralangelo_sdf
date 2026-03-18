@@ -103,7 +103,7 @@ class OrbitCamera:
         norm = 1.0 / math.sqrt(len2)
         return np.array([x * norm, y * norm, 0.0], dtype=np.float32)
 
-    def trackball_rotate(self, start_trackball, curr_trackball, invert=False):
+    def trackball_rotate(self, start_trackball, curr_trackball, invert=True):
         start = _normalize(np.asarray(start_trackball, dtype=np.float32))
         curr = _normalize(np.asarray(curr_trackball, dtype=np.float32))
         axis_cam = np.cross(start, curr)
