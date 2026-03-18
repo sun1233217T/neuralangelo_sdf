@@ -297,7 +297,12 @@ class Timer(object):
         self.cfg = cfg
         self.time_iteration = 0
         self.time_epoch = 0
-        if is_master():
+        self._timeout_watchdog_enabled = (
+            is_master() and
+            hasattr(signal, 'SIGALRM') and
+            callable(getattr(signal, 'alarm', None))
+        )
+        if self._timeout_watchdog_enabled:
             # noinspection PyTypeChecker
             signal.signal(signal.SIGALRM, functools.partial(alarm_handler, self.cfg.timeout_period))
 
@@ -373,4 +378,5 @@ class Timer(object):
 
     @master_only
     def reset_timeout_counter(self):
-        signal.alarm(self.cfg.timeout_period)
+        if self._timeout_watchdog_enabled:
+            signal.alarm(self.cfg.timeout_period)
