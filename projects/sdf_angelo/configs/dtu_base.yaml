@@ -1,0 +1,48 @@
+# Generic DTU base config for sdf_angelo.
+# No scene-specific data.root; pass --data.root=/path/to/scanXX on the command line.
+_parent_: projects/sdf_angelo/configs/base.yaml
+
+max_iter: 120000
+checkpoint:
+    save_iter: 20000
+    save_epoch: 9999999999
+
+validation_iter: 1000
+
+model:
+    object:
+        s_var:
+            init_val: 1.4
+    render:
+        rand_rays: 2048
+        num_samples:
+            coarse: 32
+            fine: 2
+            background: 32
+        num_sample_hierarchy: 5
+
+optim:
+    params:
+        lr: 3e-3
+    sched:
+        warm_up_end: 2000
+        two_steps: [100000, 150000]
+
+data:
+    type: projects.sdf_angelo.data
+    use_multi_epoch_loader: True
+    num_workers: 4
+    preload: True
+    num_images:
+    train:
+        image_size: [1200, 1600]
+        batch_size: 1
+        subset:
+    val:
+        image_size: [300, 400]
+        batch_size: 1
+        subset: 1
+        max_viz_samples: 16
+    readjust:
+        center: [0., 0., 0.]
+        scale: 1.

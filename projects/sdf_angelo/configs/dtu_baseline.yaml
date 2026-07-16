@@ -1,0 +1,8 @@
+# DTU baseline: Neuralangelo-style SDF training without sparse point-cloud SDF warmup.
+_parent_: projects/sdf_angelo/configs/dtu_base.yaml
+
+trainer:
+    loss_weight:
+        pc_sdf: 0.0
+    pointcloud_sdf:
+        enabled: False

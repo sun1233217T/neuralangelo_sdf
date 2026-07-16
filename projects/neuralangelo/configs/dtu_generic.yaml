@@ -1,0 +1,6 @@
+# Generic DTU config for the original Neuralangelo model/trainer.
+# Use --data.root=/path/to/scanXX on the command line.
+_parent_: projects/neuralangelo/configs/dtu.yaml
+
+data:
+    root:

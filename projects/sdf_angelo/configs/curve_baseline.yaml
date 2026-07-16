@@ -1,0 +1,27 @@
+_parent_: logs/test/sdf_fast_train_baseline/config.yaml
+
+max_iter: 100000
+checkpoint:
+    save_iter: 20000
+    save_latest_iter: 20000
+
+logging_iter: 1000
+wandb_scalar_iter: 100
+validation_iter: 5000
+
+trainer:
+    loss_weight:
+        render: 1.0
+        eikonal: 0.1
+        curvature: 5e-4
+        sdf_render: 1.0
+        pc_sdf: 0.0
+    pointcloud_sdf:
+        enabled: False
+        path: sparse/0/points3D.bin
+        num_samples: 20000
+        warmup_iters: 2000
+        end_iter: 50000
+        loss_type: huber
+        huber_delta: 0.1
+        max_error: 2.0
