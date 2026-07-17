@@ -21,6 +21,13 @@ import re
 import subprocess
 import sys
 import time
+
+
+def _is_nan(v):
+    try:
+        return math.isnan(float(v))
+    except (TypeError, ValueError):
+        return False
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -476,7 +483,7 @@ def format_markdown_table(rows):
         vals = []
         for k in keys:
             v = r.get(k, "")
-            if v is None:
+            if v is None or _is_nan(v):
                 v = ""
             elif k in int_keys:
                 v = str(int(v))

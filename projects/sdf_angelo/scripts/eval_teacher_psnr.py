@@ -112,6 +112,9 @@ def main():
         cfg.local_rank = args.local_rank
         init_dist(cfg.local_rank, rank=-1, world_size=-1)
 
+    # Ensure logdir exists for the checkpointer.
+    cfg.logdir = args.output_dir or ""
+
     # Overrides.
     if args.data_root:
         cfg.data.root = args.data_root
