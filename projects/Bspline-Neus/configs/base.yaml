@@ -1,0 +1,110 @@
+# ---------------------------------------------------------------------------
+# Base configuration for Bspline-Neus.
+# Inherits from projects/neuralangelo/configs/base.yaml and overrides the
+# model/trainer/data types to use the B-spline field wrappers.
+# ---------------------------------------------------------------------------
+
+_parent_: projects/neuralangelo/configs/base.yaml
+
+logging_iter: 9999999999999
+
+max_iter: 500000
+
+wandb_scalar_iter: 100
+wandb_image_iter: 10000
+validation_iter: 5000
+speed_benchmark: False
+
+checkpoint:
+    save_iter: 20000
+    strict_resume: False
+
+trainer:
+    type: projects.Bspline-Neus.trainer
+    ema_config:
+        enabled: False
+        load_ema_checkpoint: False
+    # CUDA-graph training step (projects/Bspline-Neus/graph_runner.py):
+    # captures fwd+bwd once and replays it, removing per-iteration launch
+    # overhead.  The graph is re-captured after each refinement event.
+    cudagraph:
+        enabled: False
+        capture_iter: 0
+    loss_weight:
+        render: 1.0
+        eikonal: 0.1
+        curvature: 5e-4
+    init:
+        type: none
+    amp_config:
+        enabled: False
+    depth_vis_scale: 0.5
+
+model:
+    type: projects.Bspline-Neus.model
+    inside_out: False
+    object:
+        # B-spline field configuration replaces model.object.sdf and model.object.rgb.
+        bspline:
+            grid_size: 128
+            sdf_spline_degree: 2
+            color_spline_degree: 2
+            color_sh_degree: 2
+            bounds: [[-2.0, 2.0], [-2.0, 2.0], [-2.0, 2.0]]
+            sdf_init: 0.1
+            sdf_inv_s_init: 1.0
+            sdf_init_mode: sphere
+            sdf_init_sphere_radius: 0.1
+            sdf_init_sphere_center: [0.0, 0.0, 0.0]
+            color_init: [0.5, 0.5, 0.5]
+            color_lr: 0.04
+            color_sh_rest_lr_multiplier: 0.025
+            # Sparse hierarchical B-spline backend (THB project).  When
+            # enabled, the dense grids above are replaced by a base grid of
+            # size base_grid_size that is refined on schedule up to
+            # max_levels (grid size roughly doubles per level).
+            hierarchical:
+                enabled: False
+                color_enabled: False
+                base_grid_size: 34
+                max_levels: 4
+                refine_iters: [20000, 60000, 120000]
+                refine_sdf_band: 0.05
+                transfer_mode: hb
+                # Optional override for the color field (defaults to
+                # transfer_mode).  THB for 27-channel color needs dense
+                # prolongation grids at refine time; HB is exact and cheap.
+                color_transfer_mode: null
+        # Keep only for NeuS annealing progress.
+        s_var:
+            init_val: 1.0
+            anneal_end: 0.1
+    background:
+        enabled: True
+        white: False
+    appear_embed:
+        enabled: False
+        dim: 8
+
+optim:
+    type: AdamW
+    params:
+        lr: 3e-3
+        weight_decay: 1e-5
+    sched:
+        iteration_mode: True
+        type: two_steps_with_warmup
+        warm_up_end: 5000
+        two_steps: [300000, 400000]
+        gamma: 10.0
+
+data:
+    type: projects.Bspline-Neus.data
+    auto_bounds:
+        enabled: True
+        target_half_bound: 2.0
+        ply_filename: points.ply
+        quantile_low: 0.1
+        quantile_high: 0.9
+        padding_ratio: 0.15
+        force_cube: True

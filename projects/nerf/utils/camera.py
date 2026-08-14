@@ -256,8 +256,12 @@ def cam2img(X, cam_intr):
     return X @ cam_intr.transpose(-1, -2)
 
 
-def img2cam(X, cam_intr):
-    return X @ cam_intr.inverse().transpose(-1, -2)
+def img2cam(X, cam_intr, cam_intr_inv=None):
+    # Precomputed inverse intrinsics avoid a cuSOLVER inverse per forward
+    # (device sync, not CUDA-graph capturable).
+    if cam_intr_inv is None:
+        cam_intr_inv = cam_intr.inverse()
+    return X @ cam_intr_inv.transpose(-1, -2)
 
 
 def cam2world(X, pose):
@@ -280,12 +284,13 @@ def angle_to_rotation_matrix(a, axis):
     return M
 
 
-def get_center_and_ray(pose, intr, image_size):
+def get_center_and_ray(pose, intr, image_size, intr_inv=None):
     """
     Args:
         pose (tensor [3,4]/[B,3,4]): Camera pose.
         intr (tensor [3,3]/[B,3,3]): Camera intrinsics.
         image_size (list of int): Image size.
+        intr_inv (tensor [3,3]/[B,3,3], optional): Precomputed inverse intrinsics.
     Returns:
         center_3D (tensor [HW,3]/[B,HW,3]): Center of the camera.
         ray (tensor [HW,3]/[B,HW,3]): Ray of the camera with depth=1 (note: not unit ray).
@@ -302,7 +307,7 @@ def get_center_and_ray(pose, intr, image_size):
     if len(pose.shape) == 3:
         batch_size = len(pose)
         xy_grid = xy_grid.repeat(batch_size, 1, 1)  # [B,HW,2]
-    grid_3D = img2cam(to_hom(xy_grid), intr)  # [HW,3]/[B,HW,3]
+    grid_3D = img2cam(to_hom(xy_grid), intr, intr_inv)  # [HW,3]/[B,HW,3]
     center_3D = torch.zeros_like(grid_3D)  # [HW,3]/[B,HW,3]
     # Transform from camera to world coordinates.
     grid_3D = cam2world(grid_3D, pose)  # [HW,3]/[B,HW,3]

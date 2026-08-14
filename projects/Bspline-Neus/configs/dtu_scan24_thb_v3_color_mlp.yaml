@@ -1,0 +1,29 @@
+# ---------------------------------------------------------------------------
+# Color MLP ablation of dtu_scan24_thb_v3_color_p1.yaml.
+#
+# E5 showed that lowering the spatial color B-spline degree to p=1 (C0 linear)
+# fixes the over-smoothing of p=2 and reaches 25.43 dB.  E6 showed that going
+# all the way to p=0 (piecewise constant) hurts quality (24.43 dB), so p=1 is
+# the current sweet spot for a direct B-spline color representation.
+#
+# This config replaces the B-spline SH color field with a hierarchical p=1
+# spatial *feature* grid decoded by a tiny MLP.  The MLP receives the sampled
+# spatial feature, the 3D query point, and the view direction, and outputs RGB.
+# Hypothesis: a small MLP can learn RGB-channel correlations and richer
+# view-dependent effects than fixed SH projection, while the B-spline feature
+# grid still provides the memory-efficient sparse spatial scaffold.
+#
+# Launch (single GPU, from scratch):
+#   python train.py --config projects/Bspline-Neus/configs/dtu_scan24_thb_v3_color_mlp.yaml \
+#       --logdir logs/thb_v3_color_mlp --single_gpu \
+#       --validation_iter=999999999 --checkpoint.save_iter=50000
+# ---------------------------------------------------------------------------
+
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_thb_v3_color_p1.yaml
+
+model:
+    object:
+        bspline:
+            color_mode: mlp
+            color_feature_dim: 16
+            color_mlp_hidden_dims: [64, 64]

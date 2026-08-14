@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------------------
+# E4 experiment (from scratch): loss-guided refinement marking.
+#
+# E3' (dtu_scan24_thb_v2.yaml, per-round bands + center probing) reached
+# 23.27 dB @500k vs 22.92 for THB v1 — but the error decomposition showed the
+# gain was global/flat-region, NOT edge-targeted: edge MSE only -6.6% while
+# the remaining gap to dense (24.42) is 73% concentrated in edge pixels.
+# Root cause: band marking can only refine where the *current* (blurry) SDF
+# already has signal; thin structures absent at refine time never get fine
+# basis functions (the coverage trap).
+#
+# E4 replaces the marking criterion itself: render loss is scattered per
+# training ray into the finest level's cell grid (weight * |rgb-gt| per
+# sample, normalized by visit count), and refinement marks the topk cells by
+# accumulated loss score (budget = refine_max_marked_fraction).  Marking is
+# thus decoupled from the current SDF field — thin structures with high
+# render error attract refinement even if the SDF band misses them.
+# Everything else (grid ladder, refine schedule, caps) is identical to E3'
+# so the two runs are directly comparable.
+#
+# Launch (single GPU, from scratch):
+#   python train.py --config projects/Bspline-Neus/configs/dtu_scan24_thb_v3.yaml \
+#       --logdir logs/thb_v3 --single_gpu \
+#       --validation_iter=999999999 --checkpoint.save_iter=50000
+# ---------------------------------------------------------------------------
+
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_thb_v2.yaml
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                # Mark cells by accumulated render loss (topk under the
+                # fraction cap) instead of the |SDF| band.  Falls back to the
+                # band when no statistics exist (e.g. resume exactly on a
+                # refine iteration).  refine_sdf_band stays in the config for
+                # that fallback path.
+                refine_mark_mode: loss

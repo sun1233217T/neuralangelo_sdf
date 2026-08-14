@@ -81,7 +81,8 @@ class BaseTrainer(object):
         else:
             self.credentials = None
         if 'TORCH_HOME' not in os.environ:
-            os.environ['TORCH_HOME'] = os.path.join(os.environ['HOME'], ".cache")
+            home_dir = os.environ.get('HOME') or os.environ.get('USERPROFILE')
+            os.environ['TORCH_HOME'] = os.path.join(home_dir, ".cache")
 
     def set_data_loader(self, cfg, split, shuffle=True, drop_last=True, seed=0):
         """Set the data loader corresponding to the indicated split.
@@ -249,7 +250,8 @@ class BaseTrainer(object):
                     with open(wandb_path, "w") as f:
                         f.write(wandb_id)
             if use_group:
-                group, name = cfg.logdir.split("/")[-2:]
+                logdir_parts = [p for p in os.path.normpath(cfg.logdir).split(os.sep) if p]
+                group, name = logdir_parts[-2] if len(logdir_parts) >= 2 else None, logdir_parts[-1] if logdir_parts else "run"
             else:
                 group, name = None, os.path.basename(cfg.logdir)
 
@@ -540,7 +542,10 @@ class BaseTrainer(object):
     def _get_total_loss(self):
         r"""Return the total loss to be backpropagated.
         """
-        total_loss = torch.tensor(0., device=torch.device('cuda'))
+        # torch.zeros allocates on device directly; torch.tensor(0., device=...)
+        # would pay a synchronous host-to-device copy per iteration and is
+        # not CUDA-graph capturable.
+        total_loss = torch.zeros((), device=torch.device('cuda'))
         # Iterates over all possible losses.
         for loss_name in self.weights:
             if loss_name in self.losses:
@@ -645,8 +650,16 @@ class Checkpointer(object):
             print(f"Loading checkpoint (local): {checkpoint_path}")
             # Load the state dicts.
             print('- Loading the model...')
-            # print(self.model.module.neural_sdf.mlp.linears[0].weight_g[:20])
-            # print(state_dict['model']['module.neural_sdf.mlp.linears.0.weight_g'][:20])
+            # Let the model adapt its structure to the checkpoint (e.g. grow
+            # hierarchical fields) before any key/shape filtering happens.
+            # Unwrap DDP/DataParallel: arbitrary attributes do not forward.
+            model = self.model
+            while model is not None:
+                prepare = getattr(model, "prepare_load_state_dict", None)
+                if callable(prepare):
+                    prepare(state_dict['model'])
+                    break
+                model = getattr(model, "module", None)
             if strict_flag:
                 self.model.load_state_dict(state_dict['model'], strict=True)
             else:
@@ -672,6 +685,12 @@ class Checkpointer(object):
                 # state_dict['epoch'] = 0
                 # state_dict['iteration'] = 0
                 print('- Not all model parameters were loaded!')
+            # Let the trainer react to a structure-restoring load (e.g.
+            # rebuilt optimizer around restored hierarchical parameters)
+            # before optimizer state is loaded below.
+            hook = getattr(self, "post_model_load_hook", None)
+            if callable(hook):
+                hook()
             # print(self.model.module.neural_sdf.mlp.linears[0].weight_g[:20])
             
             if resume:

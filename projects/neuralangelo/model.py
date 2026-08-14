@@ -67,7 +67,7 @@ class Model(BaseModel):
         # Randomly sample and render the pixels.
         output = self.render_pixels(data["pose"], data["intr"], image_size=self.image_size_train,
                                     stratified=self.cfg_render.stratified, sample_idx=data["idx"],
-                                    ray_idx=data["ray_idx"])
+                                    ray_idx=data["ray_idx"], intr_inv=data.get("intr_inv"))
         return output
 
     @torch.no_grad()
@@ -113,8 +113,9 @@ class Model(BaseModel):
             output[key] = torch.cat(value, dim=1)
         return output
 
-    def render_pixels(self, pose, intr, image_size, stratified=False, sample_idx=None, ray_idx=None):
-        center, ray = camera.get_center_and_ray(pose, intr, image_size)  # [B,HW,3]
+    def render_pixels(self, pose, intr, image_size, stratified=False, sample_idx=None, ray_idx=None,
+                      intr_inv=None):
+        center, ray = camera.get_center_and_ray(pose, intr, image_size, intr_inv=intr_inv)  # [B,HW,3]
         center = nerf_util.slice_by_ray_idx(center, ray_idx)  # [B,R,3]
         ray = nerf_util.slice_by_ray_idx(ray, ray_idx)  # [B,R,3]
         ray_unit = torch_F.normalize(ray, dim=-1)  # [B,R,3]
@@ -160,7 +161,9 @@ class Model(BaseModel):
             dists = self.sample_dists_all(center, ray_unit, near, far, stratified=stratified)  # [B,R,N,3]
         points = camera.get_3D_points_from_dist(center, ray_unit, dists)  # [B,R,N,3]
         sdfs, feats = self.neural_sdf.forward(points)  # [B,R,N,1],[B,R,N,K]
-        sdfs[outside[..., None].expand_as(sdfs)] = self.outside_val
+        # masked_fill (dense op) instead of boolean-mask assignment; see
+        # get_dist_bounds — boolean indexing breaks CUDA-graph capture.
+        sdfs = sdfs.masked_fill(outside[..., None].expand_as(sdfs), self.outside_val)
         # Compute 1st- and 2nd-order gradients.
         rays_unit = ray_unit[..., None, :].expand_as(points).contiguous()  # [B,R,N,3]
         gradients, hessians = self.neural_sdf.compute_gradients(points, training=self.training, sdf=sdfs)
@@ -209,7 +212,12 @@ class Model(BaseModel):
         dist_near, dist_far = nerf_util.intersect_with_sphere(center, ray_unit, radius=1.)
         dist_near.relu_()  # Distance (and thus depth) should be non-negative.
         outside = dist_near.isnan()
-        dist_near[outside], dist_far[outside] = 1, 1.2  # Dummy distances. Density will be set to 0.
+        # Dummy distances. Density will be set to 0.  masked_fill_ (dense op)
+        # instead of boolean-mask assignment: the latter lowers to nonzero +
+        # index_put, which forces a device sync and is not CUDA-graph
+        # capturable.
+        dist_near.masked_fill_(outside, 1)
+        dist_far.masked_fill_(outside, 1.2)
         return dist_near, dist_far, outside
 
     def get_appearance_embedding(self, sample_idx, num_rays):

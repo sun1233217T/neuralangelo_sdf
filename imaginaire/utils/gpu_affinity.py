@@ -65,6 +65,11 @@ def set_affinity(gpu_id=None):
     if gpu_id is None:
         gpu_id = int(os.getenv('LOCAL_RANK', 0))
 
+    # os.sched_setaffinity / sched_getaffinity are not available on Windows.
+    if not hasattr(os, 'sched_setaffinity'):
+        print("(os.sched_setaffinity is not available on this platform, skipping GPU affinity...)")
+        return
+
     try:
         dev = Device(gpu_id)
         # os.sched_setaffinity() method in Python is used to set the CPU affinity mask of a process indicated

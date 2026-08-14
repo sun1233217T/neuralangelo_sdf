@@ -1,0 +1,14 @@
+# ---------------------------------------------------------------------------
+# E9g full 500k: feature_dim=16, 4x256 MLP, mlp_lr=1e-3, feature_lr=0.04.
+# This was the best 8k/50k configuration in the dim/depth/lr ablation.
+# ---------------------------------------------------------------------------
+
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_thb_v3_color_mlp_v2.yaml
+
+model:
+    object:
+        bspline:
+            color_feature_dim: 16
+            color_mlp_hidden_dims: [256, 256, 256, 256]
+            color_feature_lr: 0.04
+            color_mlp_lr: 0.001

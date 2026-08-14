@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# DTU scan24 hierarchical (THB) B-spline NeuS configuration.
+# SDF: sparse hierarchical B-spline field, 34 -> 66 -> 130 -> 258
+# (cell counts 32 -> 64 -> 128 -> 256, matching the dense 256 baseline),
+# truncated (THB) basis with exact shadow-chain coefficient transfer.
+# Color: sparse hierarchical field with HB transfer (27-channel shadow chains
+# would need full dense prolongation grids; HB transfer is exact already).
+# ---------------------------------------------------------------------------
+
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_bspline_neus.yaml
+
+trainer:
+    cudagraph:
+        enabled: True
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                enabled: True
+                color_enabled: True
+                base_grid_size: 34
+                max_levels: 4
+                refine_iters: [20000, 60000, 120000]
+                refine_sdf_band: 0.05
+                transfer_mode: thb
+                color_transfer_mode: hb
+                transition_dtype: fp16

@@ -14,6 +14,37 @@ import torch
 from torch.cuda.amp import autocast
 
 
+class _CumprodGraphSafe(torch.autograd.Function):
+    """``cumprod`` with a CUDA-graph-capturable backward.
+
+    ATen's ``cumprod_backward`` runs a data-dependent loop over zero entries
+    (with device synchronizations) to apply the omitted-product correction,
+    which makes it impossible to capture in a CUDA graph.  The backward below
+    uses the closed form ``grad_x = revcumsum(grad * v) / x`` — mathematically
+    identical for nonzero ``x`` (verified against ATen to machine precision).
+    For exact-zero entries the correction term is dropped (gradient 0); in the
+    compositing use below ``x = 1 - alpha_front`` with ``alpha < 1`` strictly,
+    so the edge case does not occur in practice.
+    """
+
+    @staticmethod
+    def forward(ctx, x, dim):
+        v = x.cumprod(dim=dim)
+        ctx.save_for_backward(x, v)
+        ctx.dim = dim
+        return v
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, v = ctx.saved_tensors
+        dim = ctx.dim
+        # d v_j / d x_i = v_j / x_i for j >= i  =>  grad_x_i = sum_{j>=i} g_j v_j / x_i
+        c = (grad_output * v).flip(dim).cumsum(dim=dim).flip(dim)
+        safe_x = torch.where(x == 0, torch.ones_like(x), x)
+        grad_x = torch.where(x == 0, torch.zeros_like(x), c / safe_x)
+        return grad_x, None
+
+
 def volume_rendering_weights(ray, densities, depths, depth_far=None):
     """The volume rendering function. Details can be found in the NeRF paper.
     Args:
@@ -94,7 +125,7 @@ def alpha_compositing_weights(alphas):
     alphas_front = torch.cat([torch.zeros_like(alphas[..., :1]),
                               alphas[..., :-1]], dim=2)  # [B,R,N]
     with autocast(enabled=False):  # TODO: may be unstable in some cases.
-        visibility = (1 - alphas_front).cumprod(dim=2)  # [B,R,N]
+        visibility = _CumprodGraphSafe.apply(1 - alphas_front, 2)  # [B,R,N]
     weights = (alphas * visibility)[..., None]  # [B,R,N,1]
     return weights
 

@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------
+# Synthetic smoke-test configuration with grid_size=128 to match DTU memory.
+# ---------------------------------------------------------------------------
+
+_parent_: projects/Bspline-Neus/configs/base.yaml
+
+max_iter: 100000
+
+logging_iter: 999999999
+wandb_scalar_iter: 999999999
+wandb_image_iter: 999999999
+validation_iter: 999999999
+
+checkpoint:
+    save_iter: 999999999
+
+trainer:
+    loss_weight:
+        render: 1.0
+        eikonal: 0.1
+        curvature: 5e-4
+
+model:
+    object:
+        bspline:
+            grid_size: 128
+            sdf_spline_degree: 2
+            color_spline_degree: 2
+            color_sh_degree: 2
+            sdf_init_mode: sphere
+            sdf_init_sphere_radius: 0.5
+
+optim:
+    type: AdamW
+    params:
+        lr: 1e-3
+        weight_decay: 1e-5
+    sched:
+        iteration_mode: True
+        type: two_steps_with_warmup
+        warm_up_end: 5
+        two_steps: [8, 9]
+        gamma: 10.0
+
+data:
+    type: projects.Bspline-Neus.data
+    root: datasets/synthetic_bspline_neus
+    use_multi_epoch_loader: False
+    num_workers: 0
+    preload: False
+    num_images: 4
+    auto_bounds:
+        enabled: True
+        target_half_bound: 2.0
+        ply_filename: points.ply
+        quantile_low: 0.0
+        quantile_high: 1.0
+        padding_ratio: 0.05
+        force_cube: True
+    train:
+        image_size: [800, 800]
+        batch_size: 2
+        subset:
+    val:
+        image_size: [800, 800]
+        batch_size: 2
+        subset: 2
+        max_viz_samples: 2

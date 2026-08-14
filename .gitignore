@@ -1,5 +1,16 @@
 checkpoints
 
+# Project-specific temporary / profiling files (kept at repository root)
+/profile_*.py
+/profile_*.log
+/profile_*.trace.json
+/profile_*.json
+/diagnose_*.py
+/test_*.py
+/test_*.sh
+/run_*_ablation.py
+/tools/bin/
+
 # Other uncheckable file types
 *.zip
 *.exe
@@ -106,6 +117,9 @@ coverage.xml
 cover/
 debug_psnr/
 meshout*/
+dataset
+dataset/*
+datasets
 
 # Translations
 *.mo
