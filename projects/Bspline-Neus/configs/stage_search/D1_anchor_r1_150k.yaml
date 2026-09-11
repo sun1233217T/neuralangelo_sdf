@@ -1,0 +1,12 @@
+# D1: surface anchor with radius=1 (crossing cell + 6 face neighbors).
+# C1 (radius=0) used only 7% of baseline's L4 cells but matched PSNR.
+# Radius=1 adds the 6 face-adjacent cells per crossing, ~7x more coverage
+# while still being surface-focused.
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_E22b_optimized_150k.yaml
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                refine_surface_anchor: true
+                refine_surface_anchor_radius: 1

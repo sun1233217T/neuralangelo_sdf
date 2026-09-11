@@ -1,0 +1,24 @@
+# E22b: optimized from 50k ablations.
+# - edge_sample ratio = 0.25
+# - color_mlp_pos_freqs = 12
+# - color_mlp_lr = 0.0005
+# - color_feature_lr = 0.02
+# - color_lr = 0.08
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_thb_v3_color_mlp_v12_edge_pe_E22a_share_deg2_maxL5_500k.yaml
+
+max_iter: 500000
+validation_iter: 50000
+
+data:
+    edge_sample:
+        enabled: True
+        ratio: 0.25
+        power: 2.0
+
+model:
+    object:
+        bspline:
+            color_lr: 0.08
+            color_feature_lr: 0.02
+            color_mlp_lr: 0.0005
+            color_mlp_pos_freqs: 12

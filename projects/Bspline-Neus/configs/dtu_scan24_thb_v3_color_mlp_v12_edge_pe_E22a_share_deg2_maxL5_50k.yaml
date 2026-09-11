@@ -1,0 +1,21 @@
+# E22a 50k smoke: structure-shared SDF/color hierarchy, color degree 2.
+# Base grid is reduced to 34 to keep the level-4 index grid at 514^3.
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_thb_v3_color_mlp_v12_edge_pe_E13a_maxL5.yaml
+
+max_iter: 50000
+
+model:
+    object:
+        bspline:
+            color_spline_degree: 2
+            hierarchical:
+                base_grid_size: 34
+                share_structure: true
+                refine_iters: [5000, 15000, 30000, 45000]
+
+optim:
+    sched:
+        warm_up_end: 5000
+        two_steps: [300000, 400000]
+
+validation_iter: 10000

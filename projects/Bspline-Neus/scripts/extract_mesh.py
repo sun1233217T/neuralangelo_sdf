@@ -25,7 +25,33 @@ from imaginaire.config import Config, recursive_update_strict, parse_cmdline_arg
 from imaginaire.utils.distributed import init_dist, get_world_size, is_master, master_only_print as print  # noqa: E402
 from imaginaire.utils.gpu_affinity import set_affinity  # noqa: E402
 from imaginaire.trainers.utils.get_trainer import get_trainer  # noqa: E402
+from projects.neuralangelo.utils import mesh as _mesh_module  # noqa: E402
 from projects.neuralangelo.utils.mesh import extract_mesh, extract_texture  # noqa: E402
+
+
+def _filter_points_within_bounds(old_mesh, radius):
+    """Replace neuralangelo's unit-sphere filter with the actual field bounds.
+
+    The original ``filter_points_outside_bounding_sphere`` hard-codes
+    ``norm(v) < 1.0`` which discards vertices outside the unit sphere.  Our
+    B-spline field lives on [-B, B]^3 with B = target_half_bound (typically
+    2.0), so the mesh legitimately extends past |v|=1 and was being silently
+    truncated.  We filter by the actual circumscribed sphere radius instead.
+    """
+    import numpy as np
+    mask = np.linalg.norm(old_mesh.vertices, axis=-1) < radius
+    if np.any(mask):
+        indices = np.ones(len(old_mesh.vertices), dtype=int) * -1
+        indices[mask] = np.arange(mask.sum())
+        faces_mask = mask[old_mesh.faces[:, 0]] & mask[old_mesh.faces[:, 1]] & mask[old_mesh.faces[:, 2]]
+        new_faces = indices[old_mesh.faces[faces_mask]]
+        new_vertices = old_mesh.vertices[mask]
+        new_colors = old_mesh.visual.vertex_colors[mask]
+        new_mesh = type(old_mesh)(new_vertices, new_faces, vertex_colors=new_colors)
+    else:
+        import trimesh
+        new_mesh = trimesh.Trimesh()
+    return new_mesh
 
 
 def parse_args():
@@ -74,6 +100,12 @@ def main():
     trainer.current_iteration = trainer.checkpointer.eval_iteration
 
     bounds = cfg.model.object.bspline.bounds  # normalized-space AABB
+    # The B-spline field lives on [-B, B]^3; the circumscribed sphere radius
+    # is B*sqrt(3).  Monkey-patch neuralangelo's hard-coded unit-sphere filter.
+    half_bound = max(abs(float(b)) for axis in bounds for b in axis)
+    _mesh_module.filter_points_outside_bounding_sphere = partial(
+        _filter_points_within_bounds, radius=half_bound * 1.7320508 + 1e-4
+    )
 
     sdf_func = lambda x: -trainer.model_module.neural_sdf.sdf(x)  # noqa: E731
     texture_func = partial(extract_texture, neural_sdf=trainer.model_module.neural_sdf,

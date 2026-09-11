@@ -1,0 +1,10 @@
+# Held-out evaluation protocol: 45 train / 4 val (non-overlapping).
+# Val frames [0, 12, 24, 36] are excluded from training.
+# All future experiments should use this to measure generalization.
+# E22b's 29.20 was measured with val frames IN the training set;
+# results under this config are NOT directly comparable to E22b.
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_E22b_optimized_500k.yaml
+
+data:
+    val:
+        exclude_from_train: true

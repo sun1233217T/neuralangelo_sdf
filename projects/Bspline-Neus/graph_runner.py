@@ -80,11 +80,12 @@ class GraphTrainStep:
             # wrapper, which replays deterministically inside the graph.
             if "hier_points" in d:
                 self.model.neural_sdf.accumulate_loss(
-                    d["hier_points"], d["hier_weights"], d["rgb"], image_sampled)
+                    d["hier_points"], d["hier_weights"], d["rgb"], image_sampled,
+                    sdfs=d.get("hier_sdfs"))
             # MGC requires every output to require grad; ``outside`` is a bool
             # mask, so pass it out as a float with a zero gradient path.
             outside_d = d["outside"].to(d["rgb"].dtype) + d["rgb"].sum() * 0.0
-            return d["rgb"], d["gradients"], d["hessians"], outside_d
+            return d["rgb"], d["gradients"], d["hessians"], outside_d, d["sdfs"]
 
     def _capture(self, data):
         trainer = self.trainer
@@ -136,7 +137,7 @@ class GraphTrainStep:
         # Load this iteration's batch into the static input buffers.
         for k in self.INPUT_KEYS:
             self.static_in[k].copy_(data[k], non_blocking=True)
-        rgb, gradients, hessians, outside_d = self.graphed(
+        rgb, gradients, hessians, outside_d, sdfs = self.graphed(
             *tuple(self.static_in[k] for k in self.INPUT_KEYS))
 
         # Losses stay eager so the current schedule weights apply.
@@ -147,16 +148,22 @@ class GraphTrainStep:
         trainer.metrics["psnr"] = -10 * torch_F.mse_loss(rgb, target).log10()
         total = losses["render"] * trainer.weights.get("render", 1.0)
         if "eikonal" in trainer.weights:
-            losses["eikonal"] = eikonal_loss(gradients, outside=outside)
+            losses["eikonal"] = trainer._eikonal_loss(gradients, outside, sdfs)
             total = total + losses["eikonal"] * trainer.weights["eikonal"]
         if "curvature" in trainer.weights:
             losses["curvature"] = curvature_loss(hessians, outside=outside)
             total = total + losses["curvature"] * trainer.weights["curvature"]
+        if "mean_curvature" in trainer.weights:
+            losses["mean_curvature"] = trainer._mean_curvature_loss(
+                gradients, hessians, sdfs, outside=outside)
+            total = total + losses["mean_curvature"] * trainer.weights["mean_curvature"]
         losses["total"] = total
         trainer.losses.clear()
         trainer.losses.update(losses)
 
         total.backward()  # replays the captured backward graph
+        # Per-level gradient-RMS snapshot for logging (no-op off logging iters).
+        trainer._extra_step(data)
         trainer.optim.step()
         trainer.optim.zero_grad(**trainer.optim_zero_grad_kwargs)
         trainer._detach_losses()

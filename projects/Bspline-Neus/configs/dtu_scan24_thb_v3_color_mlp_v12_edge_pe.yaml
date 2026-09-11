@@ -1,0 +1,15 @@
+# E12: full 500k v12 + edge-aware sampling + positional encoding.
+# Inherits from the 500k v12 baseline and adds the two edge-targeting ideas.
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_thb_v3_color_mlp_v12.yaml
+
+data:
+    edge_sample:
+        enabled: True
+        ratio: 0.5
+        power: 2.0
+
+model:
+    object:
+        bspline:
+            color_mlp_pos_freqs: 6
+            color_mlp_view_freqs: 4

@@ -1,0 +1,10 @@
+# Per-level color feature dims: coarse levels use fewer dims, finest gets more.
+# L0-L1: 8 dims (低频足够), L2: 12, L3: 16, L4: 24 (细节丰富)
+# Total feature dim = 8+8+12+16+24 = 68 (vs uniform 16)
+# L4 has 95% of active CPs — giving it 1.5x dims targets capacity where needed.
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_E22b_optimized_150k.yaml
+
+model:
+    object:
+        bspline:
+            color_feature_dims: [8, 8, 12, 16, 24]

@@ -30,6 +30,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Bspline-Neus validation PSNR")
     parser.add_argument("--config", required=True, help="Path to the training config file.")
     parser.add_argument("--checkpoint", required=True, help="Checkpoint path.")
+    parser.add_argument("--split", default="val", choices=["train", "val", "test"],
+                        help="Dataset split to evaluate on.")
     parser.add_argument("--local_rank", type=int, default=os.getenv("LOCAL_RANK", 0))
     parser.add_argument("--single_gpu", action="store_true")
     args, cfg_cmd = parser.parse_known_args()
@@ -54,7 +56,16 @@ def main():
     cfg.logdir = ""
 
     trainer = get_trainer(cfg, is_inference=True, seed=0)
-    trainer.set_data_loader(cfg, split="val")
+    if args.split == "train":
+        # To evaluate the train split on full images (instead of sampled rays)
+        # we temporarily use the val dataloader but with train subset/config.
+        from imaginaire.datasets.utils.get_dataloader import get_val_dataloader
+        train_cfg = cfg.data.train
+        cfg.data.val = cfg.data.train
+        loader = get_val_dataloader(cfg, seed=0)
+    else:
+        trainer.set_data_loader(cfg, split=args.split)
+        loader = getattr(trainer, "eval_data_loader")
     # The post-model-load hook rebuilds the optimizer when structure restore
     # grows the hierarchical fields, and the rebuild reads current_iteration
     # for the scheduler.  Set a placeholder; the true value is assigned below.
@@ -63,13 +74,14 @@ def main():
     trainer.model.eval()
     trainer.current_iteration = trainer.checkpointer.eval_iteration
 
-    data_all = trainer.test(trainer.eval_data_loader, mode="val", show_pbar=True)
+    data_all = trainer.test(loader, mode="val", show_pbar=True)
 
     if is_master():
         psnr = trainer.metrics["psnr"].item()
         print(f"checkpoint: {args.checkpoint}")
+        print(f"split: {args.split}")
         print(f"samples: {len(data_all['idx'])}")
-        print(f"val PSNR: {psnr:.4f}")
+        print(f"{args.split} PSNR: {psnr:.4f}")
 
 
 if __name__ == "__main__":

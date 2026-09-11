@@ -153,6 +153,7 @@ class Model(BaseModel):
             gradient=output_object["gradient"],  # [B,R,3]/None
             gradients=output_object["gradients"],  # [B,R,No,3]
             hessians=output_object["hessians"],  # [B,R,No,3]/None
+            sdfs=output_object["sdfs"],  # [B,R,No]
         )
         return output
 

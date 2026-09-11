@@ -1,0 +1,11 @@
+# D1 approach at full 500k scale.
+# Surface crossing anchoring with radius=1, using the E22b 500k schedule.
+# D1 at 150k: 29.37 (vs baseline 28.55).  Target: beat E22b's 29.20.
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_E22b_optimized_500k.yaml
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                refine_surface_anchor: true
+                refine_surface_anchor_radius: 1

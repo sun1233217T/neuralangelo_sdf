@@ -1,5 +1,8 @@
 checkpoints
 
+# Local experiment backups (one-off configs/scripts kept out of git)
+/backups/
+
 # Project-specific temporary / profiling files (kept at repository root)
 /profile_*.py
 /profile_*.log

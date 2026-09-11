@@ -100,7 +100,7 @@ def test_color_aligned_refinement():
     before = rgb(pts, None, dirs, None, None).detach().clone()
 
     sdf_info = sdf.maybe_refine(10)
-    rgb_info = rgb.maybe_refine(10, sdf_wrapper=sdf)
+    rgb_info = rgb.maybe_refine(10, sdf_wrapper=sdf, sdf_refine_info=sdf_info)
     assert sdf_info["refined"] and rgb_info["refined"]
     assert rgb.hier_field.num_levels == 2
     # Regions stay aligned with the SDF hierarchy.

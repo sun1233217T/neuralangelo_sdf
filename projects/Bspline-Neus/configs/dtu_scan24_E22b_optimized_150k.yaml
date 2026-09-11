@@ -1,0 +1,17 @@
+# Medium-scale validation: 150k iterations with L4 getting 50k.
+# Refine schedule matches 500k proportions but L4 gets meaningful time.
+# Use this for architecture ablations where L4's effect matters.
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_E22b_optimized_500k.yaml
+
+max_iter: 150000
+validation_iter: 50000
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                refine_iters: [10000, 30000, 70000, 100000]
+
+optim:
+    sched:
+        two_steps: [100000, 130000]

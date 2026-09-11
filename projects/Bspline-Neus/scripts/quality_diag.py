@@ -20,6 +20,9 @@ import os
 import sys
 from pathlib import Path
 
+# Workaround for duplicate OpenMP runtimes on Windows (libomp vs libiomp5md).
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import numpy as np  # noqa: E402
@@ -43,6 +46,8 @@ def parse_args():
                         help="Dump per-image composites + error decomposition for the last checkpoint.")
     parser.add_argument("--err_gain", type=float, default=4.0,
                         help="Amplification factor for the error heatmap.")
+    parser.add_argument("--split", default="val", choices=["train", "val", "test"],
+                        help="Dataset split to evaluate on.")
     parser.add_argument("--local_rank", type=int, default=os.getenv("LOCAL_RANK", 0))
     parser.add_argument("--single_gpu", action="store_true")
     args, cfg_cmd = parser.parse_known_args()
@@ -163,13 +168,28 @@ def main():
     print(f"Running diagnostics with {get_world_size()} GPUs.")
 
     cfg.logdir = ""
+    # For train-split evaluation we need to return full images.  The dataset's
+    # __getitem__ checks self.split, so monkey-patch it to "val".  To make the
+    # patch visible to the DataLoader we must avoid worker subprocess copies.
+    if args.split == "train":
+        cfg.data.num_workers = 0
     trainer = get_trainer(cfg, is_inference=True, seed=0)
-    trainer.set_data_loader(cfg, split="val")
+    trainer.set_data_loader(cfg, split=args.split)
+    if args.split == "train":
+        trainer.train_data_loader.dataset.split = "val"
     trainer.current_iteration = 0
 
     out_dir = Path(args.out_dir)
     if is_master():
         out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pick the data loader matching the requested split.
+    if args.split == "train":
+        data_loader = trainer.train_data_loader
+    elif args.split == "val":
+        data_loader = trainer.eval_data_loader
+    else:
+        data_loader = trainer.eval_data_loader
 
     checkpoints = args.checkpoints.split(",")
     trajectory = []
@@ -178,7 +198,7 @@ def main():
         trainer.checkpointer.load(ckpt_path, load_opt=False, load_sch=False)
         trainer.model.eval()
         trainer.current_iteration = trainer.checkpointer.eval_iteration
-        data_all = trainer.test(trainer.eval_data_loader, mode="val", show_pbar=True)
+        data_all = trainer.test(data_loader, mode="val", show_pbar=True)
         if is_master():
             psnr = trainer.metrics["psnr"].item()
             try:
@@ -201,7 +221,7 @@ def main():
         return
 
     # ---- Error attribution for the last checkpoint ----
-    dataset = trainer.eval_data_loader.dataset
+    dataset = data_loader.dataset
     root = Path(cfg.data.root)
     all_stats = []
     for i, sample_idx in enumerate(data_all["idx"]):

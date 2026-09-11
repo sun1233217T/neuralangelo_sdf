@@ -70,7 +70,7 @@ class Model(NeuralangeloModel):
 
         # B-spline fields replace NeuralSDF/NeuralRGB.
         self.neural_sdf = BSplineSDFWrapper(cfg_bspline)
-        self.neural_rgb = BSplineRGBWrapper(cfg_bspline)
+        self.neural_rgb = BSplineRGBWrapper(cfg_bspline, sdf_wrapper=self.neural_sdf)
 
         # Optional background NeRF (reused from neuralangelo).
         if cfg_model.background.enabled:
@@ -151,6 +151,8 @@ class Model(NeuralangeloModel):
             points = camera.get_3D_points_from_dist(center, ray_unit, dists_obj)
             output["hier_points"] = points.detach()  # [B,R,No,3]
             output["hier_weights"] = output["weights"][:, :, :n_obj, 0].detach()  # [B,R,No]
+            # SDF values at each sample point for surface-crossing anchoring.
+            output["hier_sdfs"] = output["sdfs"].detach()  # [B,R,No]
         return output
 
     def render_image(self, pose, intr, image_size, stratified=False, sample_idx=None):
@@ -181,37 +183,67 @@ class Model(NeuralangeloModel):
         return output
 
     def get_param_groups(self, cfg_optim):
-        """Return parameter groups with B-spline-specific learning rates."""
+        """Return parameter groups with B-spline-specific learning rates.
+
+        Per-level LR scaling is controlled by optional config lists:
+        ``sdf_level_lr_scale`` and ``color_feature_level_lr_scale``.  Each
+        list maps level index to a multiplier on the group LR.  Missing
+        entries default to 1.0.  When absent (None), all levels share the
+        group LR as before.  Because the trainer rebuilds the optimizer at
+        every refinement, new levels automatically pick up their group's LR.
+        """
         base_lr = cfg_optim.params.lr
         color_lr = float(getattr(self.bspline_cfg, "color_lr", base_lr))
         param_groups = []
 
-        # SDF field (dense grid or hierarchical levels) and inv_std share the
-        # base learning rate.
-        sdf_params = [p for p in self.neural_sdf.parameters() if p.requires_grad]
-        if sdf_params:
-            param_groups.append({"params": sdf_params, "lr": base_lr})
+        # --- SDF field ---
+        sdf_level_scale = getattr(self.bspline_cfg, "sdf_level_lr_scale", None)
+        if self.neural_sdf.hierarchical_enabled and sdf_level_scale is not None:
+            sdf_level_scale = [float(s) for s in sdf_level_scale]
+            # inv_std and any non-level SDF params stay at base LR.
+            non_level = [
+                p for n, p in self.neural_sdf.named_parameters()
+                if p.requires_grad and not n.startswith("hier_field.levels.")
+            ]
+            if non_level:
+                param_groups.append({"params": non_level, "lr": base_lr})
+            for l, level in enumerate(self.neural_sdf.hier_field.levels):
+                scale = sdf_level_scale[l] if l < len(sdf_level_scale) else 1.0
+                if level.values.requires_grad:
+                    param_groups.append({"params": [level.values], "lr": base_lr * scale})
+        else:
+            sdf_params = [p for p in self.neural_sdf.parameters() if p.requires_grad]
+            if sdf_params:
+                param_groups.append({"params": sdf_params, "lr": base_lr})
 
-        # Color uses its own learning rate.  For the MLP-decoded color mode,
-        # the hierarchical feature grid and the MLP head benefit from separate
-        # learning rates (the grid acts like an embedding, the MLP like a
-        # small network).
+        # --- Color field ---
         color_params = [p for p in self.neural_rgb.parameters() if p.requires_grad]
         if color_params:
             bspline_cfg = self.bspline_cfg
             if str(getattr(bspline_cfg, "color_mode", "sh")).lower() == "mlp":
                 feature_lr = float(getattr(bspline_cfg, "color_feature_lr", color_lr))
                 mlp_lr = float(getattr(bspline_cfg, "color_mlp_lr", color_lr))
-                feature_params = [
-                    p for n, p in self.neural_rgb.named_parameters()
-                    if p.requires_grad and n.startswith("hier_field.")
-                ]
+                feat_level_scale = getattr(bspline_cfg, "color_feature_level_lr_scale", None)
+
+                if feat_level_scale is not None and self.neural_rgb.hierarchical_enabled:
+                    feat_level_scale = [float(s) for s in feat_level_scale]
+                    for l, level in enumerate(self.neural_rgb.hier_field.levels):
+                        scale = feat_level_scale[l] if l < len(feat_level_scale) else 1.0
+                        if level.values.requires_grad:
+                            param_groups.append(
+                                {"params": [level.values], "lr": feature_lr * scale})
+                else:
+                    feature_params = [
+                        p for n, p in self.neural_rgb.named_parameters()
+                        if p.requires_grad and n.startswith("hier_field.")
+                    ]
+                    if feature_params:
+                        param_groups.append({"params": feature_params, "lr": feature_lr})
+
                 mlp_params = [
                     p for n, p in self.neural_rgb.named_parameters()
                     if p.requires_grad and n.startswith("_mlp.")
                 ]
-                if feature_params:
-                    param_groups.append({"params": feature_params, "lr": feature_lr})
                 if mlp_params:
                     param_groups.append({"params": mlp_params, "lr": mlp_lr})
                 # Fallback for any unexpected color params (should be empty).
@@ -257,6 +289,24 @@ class Model(NeuralangeloModel):
                 if field.restore_levels_from_state_dict(state_dict, prefix):
                     restored = True
                     break
+            # A hierarchy that shares its structure with another field does not
+            # own those buffers, so any structure keys from an older checkpoint
+            # (where it owned its own structure) must be stripped before the
+            # strict state-dict load, otherwise they appear as unexpected keys.
+            if getattr(field, "structure_owner", None) is not None:
+                struct_names = {"region", "index_grid", "omega", "rmask"}
+                for key in list(state_dict.keys()):
+                    if not key.startswith(f"{mod_name}.hier_field.") and not key.startswith(
+                        f"module.{mod_name}.hier_field."
+                    ):
+                        continue
+                    local = key.split("hier_field.", 1)[-1]
+                    if local.startswith("_structures."):
+                        del state_dict[key]
+                    elif local.startswith("levels."):
+                        parts = local.split(".")
+                        if len(parts) == 3 and parts[2] in struct_names:
+                            del state_dict[key]
         # Read by the trainer's post-checkpoint-load hook to decide whether
         # the optimizer must be rebuilt around the restored parameters.
         self._hier_structure_restored = restored

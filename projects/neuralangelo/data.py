@@ -34,7 +34,17 @@ class Dataset(base.Dataset):
         with open(meta_fname) as file:
             self.meta = json.load(file)
         self.list = self.meta["frames"]
-        if cfg_data[self.split].subset:
+        # Optionally exclude validation frames from the training set so that
+        # val PSNR measures generalization to unseen views, not memorization.
+        val_subset = cfg_data.val.subset
+        if (
+            self.split == "train"
+            and val_subset
+            and getattr(cfg_data.val, "exclude_from_train", False)
+        ):
+            val_idx = set(np.linspace(0, len(self.list), val_subset + 1)[:-1].astype(int).tolist())
+            self.list = [f for i, f in enumerate(self.list) if i not in val_idx]
+        elif cfg_data[self.split].subset:
             subset = cfg_data[self.split].subset
             subset_idx = np.linspace(0, len(self.list), subset+1)[:-1].astype(int)
             self.list = [self.list[i] for i in subset_idx]

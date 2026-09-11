@@ -1,0 +1,213 @@
+# DTU scan24 dense B-spline NeuS baseline configuration.
+# This is the root config for all Bspline-Neus experiments on DTU scan24.
+
+checkpoint:
+    save_epoch: 9999999999
+    save_iter: 20000
+    save_latest_iter: 9999999999
+    save_period: 9999999999
+    strict_resume: false
+
+cudnn:
+    benchmark: true
+    deterministic: false
+
+data:
+    name: dummy
+    num_images: null
+    num_workers: 4
+    preload: true
+    auto_bounds:
+        enabled: true
+        force_cube: true
+        padding_ratio: 0.15
+        ply_filename: points.ply
+        quantile_high: 0.99
+        quantile_low: 0.01
+        target_half_bound: 2.0
+    readjust:
+        center: [0.0, 0.0, 0.0]
+        scale: 1.0
+    root: datasets/DTU/scan24
+    train:
+        batch_size: 2
+        image_size: [800, 800]
+        subset: null
+    type: projects.Bspline-Neus.data
+    use_multi_epoch_loader: true
+    val:
+        batch_size: 2
+        image_size: [800, 800]
+        max_viz_samples: 16
+        subset: 4
+
+image_save_iter: 9999999999
+inference_args: {}
+local_rank: 0
+logging_iter: 9999999999999
+max_epoch: 9999999999
+max_iter: 500000
+metrics_epoch: null
+metrics_iter: null
+
+model:
+    appear_embed:
+        dim: 8
+        enabled: false
+    background:
+        enabled: true
+        encoding:
+            levels: 10
+            type: fourier
+        encoding_view:
+            levels: 3
+            type: spherical
+        mlp:
+            activ: relu
+            activ_density: softplus
+            activ_density_params: {}
+            activ_params: {}
+            hidden_dim: 256
+            hidden_dim_rgb: 128
+            num_layers: 8
+            num_layers_rgb: 2
+            skip: [4]
+            skip_rgb: []
+        view_dep: true
+        white: false
+    inside_out: false
+    object:
+        bspline:
+            bounds: [[-2.0, 2.0], [-2.0, 2.0], [-2.0, 2.0]]
+            color_init: [0.5, 0.5, 0.5]
+            color_lr: 0.08
+            color_sh_degree: 2
+            color_sh_rest_lr_multiplier: 0.025
+            color_spline_degree: 2
+            grid_size: 256
+            hierarchical:
+                base_grid_size: 34
+                color_enabled: false
+                color_transfer_mode: null
+                enabled: false
+                max_levels: 4
+                refine_iters: [20000, 60000, 120000]
+                refine_sdf_band: 0.05
+                transfer_mode: hb
+            sdf_init: 0.1
+            sdf_init_mode: sphere
+            sdf_init_sphere_center: [0.0, 0.0, 0.0]
+            sdf_init_sphere_radius: 0.1
+            sdf_inv_s_init: 1.0
+            sdf_spline_degree: 2
+        rgb:
+            encoding_view:
+                levels: 3
+                type: spherical
+            mlp:
+                activ: relu_
+                activ_params: {}
+                hidden_dim: 256
+                num_layers: 4
+                skip: []
+                weight_norm: true
+            mode: idr
+        s_var:
+            anneal_end: 0.1
+            init_val: 1.0
+        sdf:
+            encoding:
+                coarse2fine:
+                    enabled: true
+                    init_active_level: 4
+                    step: 5000
+                hashgrid:
+                    dict_size: 22
+                    dim: 8
+                    max_logres: 11
+                    min_logres: 5
+                    range: [-2, 2]
+                levels: 16
+                type: hashgrid
+            gradient:
+                mode: numerical
+                taps: 4
+            mlp:
+                activ: softplus
+                activ_params:
+                    beta: 100
+                geometric_init: true
+                hidden_dim: 256
+                inside_out: false
+                num_layers: 1
+                out_bias: 0.5
+                skip: []
+                weight_norm: true
+    render:
+        num_sample_hierarchy: 4
+        num_samples:
+            background: 32
+            coarse: 64
+            fine: 16
+        rand_rays: 512
+        stratified: true
+    type: projects.Bspline-Neus.model
+
+nvtx_profile: false
+
+optim:
+    fused_opt: false
+    params:
+        lr: 0.003
+        weight_decay: 1.0e-05
+    sched:
+        gamma: 10.0
+        iteration_mode: true
+        step_size: 9999999999
+        two_steps: [300000, 400000]
+        type: two_steps_with_warmup
+        warm_up_end: 5000
+    type: AdamW
+
+pretrained_weight: null
+speed_benchmark: false
+
+test_data:
+    name: dummy
+    num_workers: 0
+    test:
+        batch_size: 1
+        is_lmdb: false
+        roots: null
+    type: imaginaire.datasets.images
+
+trainer:
+    type: projects.Bspline-Neus.trainer
+    amp_config:
+        backoff_factor: 0.5
+        enabled: false
+        growth_factor: 2.0
+        growth_interval: 2000
+        init_scale: 65536.0
+    ddp_config:
+        find_unused_parameters: false
+        static_graph: true
+    depth_vis_scale: 0.5
+    ema_config:
+        beta: 0.9999
+        enabled: false
+        load_ema_checkpoint: false
+        start_iteration: 0
+    grad_accum_iter: 1
+    image_to_tensorboard: false
+    init:
+        gain: null
+        type: none
+    loss_weight:
+        curvature: 0.0005
+        eikonal: 0.0005
+        render: 1.0
+
+validation_iter: 50000
+wandb_image_iter: 10000
+wandb_scalar_iter: 100
