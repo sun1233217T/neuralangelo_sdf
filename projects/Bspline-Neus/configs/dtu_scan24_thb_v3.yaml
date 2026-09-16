@@ -2,7 +2,11 @@
 # Inherits from dtu_scan24_thb.yaml and switches the marking criterion to
 # accumulated render loss anchored at the SDF zero-crossing point along each
 # ray (surface crossing anchoring).  D1 experiment showed +2.33 dB at 500k
-# (31.53 vs 29.20 for the previous best).
+# (31.53 vs 29.20 for the previous best).  W2 doubled the marking budget
+# (fraction 0.2) after ray-level analysis showed high-complexity pixels
+# stuck at coarse levels: +0.95 dB (32.48), missed-pixel count -70%.
+# T2 added activity pruning + thin-shell penalty: 32.58 dB at 500k with the
+# interior bubble web removed (L4 active basis -8.3%).
 _parent_: projects/Bspline-Neus/configs/dtu_scan24_thb.yaml
 
 model:
@@ -14,10 +18,45 @@ model:
                 refine_iters: [10000, 30000, 70000, 150000]
                 refine_mark_centers: true
                 refine_mark_mode: loss
-                refine_max_marked_fraction: 0.1
+                # W2: doubled budget; L4 capacity has headroom, coverage was
+                # the bottleneck (ray_level_analysis evidence).
+                refine_max_marked_fraction: 0.2
                 refine_sdf_band: [0.03, 0.05, 0.06, 0.08]
                 # Surface crossing anchoring: scatter render error to the
                 # estimated SDF zero-crossing point (not compositing-weight
                 # peak).  radius=1 adds the 6 face-adjacent cells.
                 refine_surface_anchor: true
                 refine_surface_anchor_radius: 1
+                # Activity pruning (T2): deactivate finest-level cells that
+                # never received any anchor hit (interior bubble web no ray
+                # ever crosses), margin=3 keeps the deg-2 support ring of
+                # every hit cell intact.  The 200k/350k schedule targets the
+                # 500k run (50k after the L4 refine + a cleanup pass); on
+                # shorter schedules add matching iters (e.g. 115k for 150k).
+                prune_iters: [200000, 350000]
+                prune_margin: 3
+
+# Thin-shell crossing penalty (T2): suppresses invisible zero-crossing
+# pairs spaced < delta along a ray (bubble webs), exempting visible detail
+# (transmittance > 0) and legitimate back faces (wide gap).  Verified
+# PSNR-neutral at 150k and 500k.
+# Bubble-suppressing mean-curvature regularization (normalized Laplacian
+# proxy, L1 penalty above threshold, active from the L3 refinement on).
+# Effective at short training (150k: -63% high-curvature tail at -0.13 dB),
+# but DISABLED by default: at 500k the baseline already self-cleans bubbles
+# (P(|H|>200): 1.60% @140k -> 1.06% @500k) and the regularizer adds nothing
+# while costing 0.43 dB (MC6: 31.10 vs 31.53).  Enable only for short runs
+# by setting loss_weight.mean_curvature: 0.001.
+trainer:
+    loss_weight:
+        mean_curvature: 0.0
+        thin_shell: 0.1
+    mean_curvature_params:
+        threshold: 400.0
+        band: 0.05
+        norm: 1
+        start_iter: 70000
+    thin_shell_params:
+        delta: 0.03
+        transmittance: 0.01
+        tau: 0.005

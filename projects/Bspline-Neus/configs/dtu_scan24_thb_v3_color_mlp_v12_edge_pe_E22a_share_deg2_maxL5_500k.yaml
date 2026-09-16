@@ -1,0 +1,14 @@
+# E22a full 500k: structure-shared SDF/color hierarchy, color degree 2.
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_thb_v3_color_mlp_v12_edge_pe_E13a_maxL5.yaml
+
+max_iter: 500000
+
+model:
+    object:
+        bspline:
+            color_spline_degree: 2
+            hierarchical:
+                base_grid_size: 34
+                share_structure: true
+
+validation_iter: 50000

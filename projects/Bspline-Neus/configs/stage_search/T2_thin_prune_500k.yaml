@@ -1,0 +1,20 @@
+# T2: 500k full run = W2 (fraction 0.2 via default thb_v3) + activity
+# pruning + thin-shell prevention (w=0.1).
+# Prune schedule: 200k (50k after the L4 refine, same spacing as P1's
+# 115k-after-100k) and a second cleanup at 350k.
+_parent_: projects/Bspline-Neus/configs/stage_search/D1_anchor_r1_500k.yaml
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                prune_iters: [200000, 350000]
+                prune_margin: 3
+
+trainer:
+    loss_weight:
+        thin_shell: 0.1
+    thin_shell_params:
+        delta: 0.03
+        transmittance: 0.01
+        tau: 0.005

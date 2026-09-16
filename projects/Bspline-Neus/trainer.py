@@ -121,6 +121,7 @@ class Trainer(NeuralangeloTrainer):
         mc_params = getattr(self.cfg.trainer, "mean_curvature_params", {})
         threshold = float(getattr(mc_params, "threshold", 20.0))
         band = float(getattr(mc_params, "band", 0.05))
+        norm = int(getattr(mc_params, "norm", 2))
 
         lap = hessians.sum(dim=-1)  # (B,R,N) — Laplacian from diagonal
         gn = gradients.norm(dim=-1)  # (B,R,N) — |∇f|
@@ -128,12 +129,60 @@ class Trainer(NeuralangeloTrainer):
         H = H.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
 
         # Threshold: only penalize curvature above threshold (bubbles).
-        mc_err = (H.abs() - threshold).clamp_min(0.0) ** 2
+        excess = (H.abs() - threshold).clamp_min(0.0)
+        mc_err = excess if norm == 1 else excess ** 2
         # Band: only apply near surface.
         w = (sdfs.abs() < band).to(mc_err.dtype)
         if outside is not None:
             w = w * (~outside).to(mc_err.dtype)
         return (mc_err * w).sum() / (w.sum() + 1e-8)
+
+    def _thin_shell_loss(self, sdfs, dists, weights):
+        """Thin-shell crossing penalty: suppress invisible bubble webs.
+
+        A ray through a solid object has widely spaced entry/exit zero
+        crossings; an interior bubble ("thin shell") creates a *pair* of
+        crossings separated by only a few cells.  Penalize soft sign flips
+        that (a) occur less than ``delta`` behind a previous flip and
+        (b) sit in fully absorbed regions (transmittance < t_thresh, i.e.
+        invisible).  Legitimate back faces are far from the entry crossing
+        and visible thin details have transmittance > 0 — both exempt.
+
+        The soft flip sigmoid makes the objective differentiable (it pushes
+        the bracketing SDF values to the same sign, erasing the thin bump).
+        All ops are static-shape and CUDA-graph safe.
+        """
+        p = getattr(self.cfg.trainer, "thin_shell_params", {})
+        delta = float(getattr(p, "delta", 0.03))
+        t_thresh = float(getattr(p, "transmittance", 0.01))
+        tau = float(getattr(p, "tau", 0.005))
+
+        s = sdfs  # (B,R,N)
+        d = dists[..., 0] if dists.dim() == s.dim() + 1 else dists  # (B,R,N)
+        w = weights[..., 0] if weights.dim() == s.dim() + 1 else weights  # (B,R,N)
+
+        soft_flip = torch.sigmoid(-s[..., :-1] * s[..., 1:] / tau)  # (B,R,N-1)
+        # Hard (detached) flip mask: the sigmoid leaks sigmoid(-|s|²/tau)
+        # ≈ 0.1 between same-sign small-|s| samples, which would penalize
+        # the whole near-surface band; restrict to true sign changes.
+        hard_flip = (s[..., :-1] * s[..., 1:] < 0).to(soft_flip.dtype).detach()
+        flip_pos = torch.where(hard_flip > 0.5, d[..., 1:],
+                               torch.full_like(d[..., 1:], -1e9))
+        last_flip, _ = torch.cummax(flip_pos, dim=-1)
+        # Shift right by one: the gap of flip j must be measured to the
+        # *previous* flip, not to itself.
+        last_flip = torch.cat([torch.full_like(last_flip[..., :1], -1e9),
+                               last_flip[..., :-1]], dim=-1)
+        # Distance since the previous flip along the ray; rays with no prior
+        # flip get gap ~ 1e9 -> thin = 0 automatically.
+        gap = d[..., 1:] - last_flip
+        T_before = 1.0 - torch.cumsum(w, dim=-1)
+        T_before = torch.cat([torch.ones_like(T_before[..., :1]), T_before[..., :-1]], dim=-1)
+        invisible = (T_before[..., 1:] < t_thresh).to(soft_flip.dtype)
+        thin = ((delta - gap).clamp_min(0.0) / delta).detach()
+        pen = soft_flip * hard_flip * thin * invisible
+        # Fraction of all true flips that are invisible thin-shell pairs.
+        return pen.sum() / (hard_flip.sum() + 1e-8)
 
     def _compute_loss(self, data, mode=None):
         if mode == "train":
@@ -155,6 +204,10 @@ class Trainer(NeuralangeloTrainer):
             if "mean_curvature" in self.weights:
                 self.losses["mean_curvature"] = self._mean_curvature_loss(
                     data["gradients"], data["hessians"], data["sdfs"], outside=data["outside"])
+            if "thin_shell" in self.weights:
+                n_obj = data["gradients"].shape[2]
+                self.losses["thin_shell"] = self._thin_shell_loss(
+                    data["sdfs"], data["dists"][:, :, :n_obj], data["weights"][:, :, :n_obj])
         else:
             # Compute loss on the entire image.
             self.losses["render"] = self.criteria["render"](data["rgb_map"], data["image"])
@@ -182,6 +235,13 @@ class Trainer(NeuralangeloTrainer):
         # Skip hash-grid coarse2fine handling (not applicable to B-spline fields).
         # Only update numerical-gradient curvature weight if requested.
         self.get_curvature_weight(current_iteration, self.cfg.trainer.loss_weight.curvature)
+        # Mean-curvature regularizer: optional late start so geometry forms
+        # first and the penalty only suppresses late-stage bubble artifacts.
+        if "mean_curvature" in self.weights:
+            mc_params = getattr(self.cfg.trainer, "mean_curvature_params", {})
+            start_iter = int(getattr(mc_params, "start_iter", 0))
+            base = float(self.cfg.trainer.loss_weight.get("mean_curvature", 0.0))
+            self.weights["mean_curvature"] = 0.0 if current_iteration < start_iter else base
         # Hierarchical B-spline refinement: grow the hierarchy on schedule and
         # rebuild the optimizer around the new parameter tensors.  The color
         # hierarchy refines with the same SDF-band cells so both stay aligned.
@@ -223,9 +283,15 @@ class Trainer(NeuralangeloTrainer):
             reband_all_rgb = model.neural_rgb.maybe_reband_all(
                 current_iteration, sdf_reband_info=reband_all_sdf,
             )
+            # Activity-based pruning of the finest level (bubble-web removal).
+            prune_sdf = model.neural_sdf.maybe_prune(current_iteration)
+            prune_rgb = model.neural_rgb.maybe_prune(
+                current_iteration, sdf_prune_info=prune_sdf,
+            )
             rebanded = any(
                 r is not None and r.get("changed")
-                for r in (reband_sdf, reband_rgb, reband_all_sdf, reband_all_rgb)
+                for r in (reband_sdf, reband_rgb, reband_all_sdf, reband_all_rgb,
+                          prune_sdf, prune_rgb)
             )
             if rebanded:
                 self._rebuild_optimizer()

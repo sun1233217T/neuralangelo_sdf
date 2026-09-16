@@ -85,7 +85,12 @@ class GraphTrainStep:
             # MGC requires every output to require grad; ``outside`` is a bool
             # mask, so pass it out as a float with a zero gradient path.
             outside_d = d["outside"].to(d["rgb"].dtype) + d["rgb"].sum() * 0.0
-            return d["rgb"], d["gradients"], d["hessians"], outside_d, d["sdfs"]
+            # dists/weights are constants w.r.t. parameters; give them the
+            # same zero-gradient path so MGC accepts them as outputs.
+            flat = d["rgb"].sum() * 0.0
+            dists_d = d["dists"].to(d["rgb"].dtype) + flat
+            weights_d = d["weights"].to(d["rgb"].dtype) + flat
+            return d["rgb"], d["gradients"], d["hessians"], outside_d, d["sdfs"], dists_d, weights_d
 
     def _capture(self, data):
         trainer = self.trainer
@@ -127,6 +132,20 @@ class GraphTrainStep:
             except Exception as exc:  # noqa: BLE001 - any capture failure -> eager
                 import traceback
                 traceback.print_exc()
+                # Diagnose which parameters are disconnected from the graph
+                # (a common post-refine/prune failure: a level's values not
+                # touched by the capture batch).
+                try:
+                    model = trainer.model_module
+                    diag = self._StepModule(model)
+                    outs = diag(*tuple(self.static_in[k] for k in self.INPUT_KEYS))
+                    total = sum(o.float().sum() for o in outs if o is not None)
+                    params = [p for p in diag.parameters() if p.requires_grad]
+                    grads = torch.autograd.grad(total, params, allow_unused=True)
+                    unused = [n for n, g in zip([n for n, p in diag.named_parameters() if p.requires_grad], grads) if g is None]
+                    print(f"[graph] capture diagnostic: unused params: {unused}")
+                except Exception as diag_exc:  # noqa: BLE001
+                    print(f"[graph] capture diagnostic failed: {diag_exc}")
                 print(f"[graph] capture FAILED ({type(exc).__name__}: {exc}); "
                       "falling back to eager training permanently")
                 self.failed = True
@@ -137,7 +156,7 @@ class GraphTrainStep:
         # Load this iteration's batch into the static input buffers.
         for k in self.INPUT_KEYS:
             self.static_in[k].copy_(data[k], non_blocking=True)
-        rgb, gradients, hessians, outside_d, sdfs = self.graphed(
+        rgb, gradients, hessians, outside_d, sdfs, dists_d, weights_d = self.graphed(
             *tuple(self.static_in[k] for k in self.INPUT_KEYS))
 
         # Losses stay eager so the current schedule weights apply.
@@ -157,6 +176,11 @@ class GraphTrainStep:
             losses["mean_curvature"] = trainer._mean_curvature_loss(
                 gradients, hessians, sdfs, outside=outside)
             total = total + losses["mean_curvature"] * trainer.weights["mean_curvature"]
+        if "thin_shell" in trainer.weights:
+            n_obj = gradients.shape[2]
+            losses["thin_shell"] = trainer._thin_shell_loss(
+                sdfs, dists_d[:, :, :n_obj], weights_d[:, :, :n_obj])
+            total = total + losses["thin_shell"] * trainer.weights["thin_shell"]
         losses["total"] = total
         trainer.losses.clear()
         trainer.losses.update(losses)

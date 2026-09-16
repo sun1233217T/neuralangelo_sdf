@@ -1,0 +1,9 @@
+# E13a: enable the 4th refinement by raising max_levels to 5.
+# schedule: L0(10k) -> L1(30k) -> L2(70k) -> L3(150k), keeping loss marking.
+_parent_: projects/Bspline-Neus/configs/dtu_scan24_thb_v3_color_mlp_v12_edge_pe.yaml
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                max_levels: 5

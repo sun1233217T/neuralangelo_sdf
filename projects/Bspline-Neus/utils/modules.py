@@ -566,7 +566,10 @@ class BSplineSDFWrapper(nn.Module):
         """
         if not self.loss_marking_enabled:
             return
-        if self.hier_field.num_levels >= self.hier_field.max_levels:
+        if self.hier_field.num_levels >= self.hier_field.max_levels \
+                and not self.hier_cfg.get("prune_iters", []):
+            # No further refinement and no activity-based pruning scheduled:
+            # the statistics would never be consumed.
             return
         level = self.hier_field.levels[-1]
         cc = level.cell_count
@@ -857,6 +860,53 @@ class BSplineSDFWrapper(nn.Module):
                 for s in info["per_level"] if s["added"] or s["removed"]
             )
             print(f"[Bspline-Neus] reband_all at iter {iteration}: {stats}")
+        return info
+
+    @torch.no_grad()
+    def maybe_prune(self, iteration):
+        """Activity-based pruning of the finest level at scheduled iterations.
+
+        Cells that never received any loss-marking hits (zero accumulated
+        count) since the last refinement are deactivated, subject to a
+        dilation margin so the B-spline support of every marked cell stays
+        intact (deg-2 needs a 1-ring; the default margin of 3 is
+        conservative).  This removes the interior "bubble web" that no
+        camera ray ever crosses.  Config keys:
+            prune_iters: list of iterations to fire.
+            prune_margin: dilation radius around hit cells (default 3).
+        """
+        if not self.hierarchical_enabled:
+            return None
+        prune_iters = [int(i) for i in self.hier_cfg.get("prune_iters", [])]
+        if iteration not in prune_iters:
+            return None
+        level = self.hier_field.levels[-1]
+        cc = level.cell_count
+        if (
+            self._loss_count is None
+            or tuple(self._loss_count.shape) != (cc,) * 3
+            or not bool(self._loss_count.any())
+        ):
+            print("[Bspline-Neus] prune requested but no loss statistics; skipping.")
+            return None
+        margin = int(self.hier_cfg.get("prune_margin", 3))
+        live = (self._loss_count > 0).float()[None, None]
+        if margin > 0:
+            keep = F.max_pool3d(live, kernel_size=2 * margin + 1, stride=1,
+                                padding=margin)[0, 0] > 0
+        else:
+            keep = live[0, 0] > 0
+        info = self.hier_field.prune_finest(keep)
+        if info.get("changed"):
+            print(f"[Bspline-Neus] pruning at iter {iteration}: "
+                  f"removed={info['removed']}, "
+                  f"active={int(self.hier_field.levels[-1].num_active)}")
+            # Region change replaces value tensors: re-register grad hooks.
+            if self.grad_marking_enabled:
+                self._register_grad_hooks()
+        else:
+            print(f"[Bspline-Neus] pruning at iter {iteration}: no-op "
+                  f"({info.get('reason', 'nothing to remove')})")
         return info
 
 
@@ -1306,3 +1356,26 @@ class BSplineRGBWrapper(nn.Module):
         if info.get("changed"):
             self._register_sh_hooks()
         return info
+
+    @torch.no_grad()
+    def maybe_prune(self, iteration, sdf_prune_info=None):
+        """Sync color values after the SDF hierarchy prunes the finest level.
+
+        Mirrors :meth:`maybe_reband`: when sharing structure, the shared
+        LevelStructure has already been updated by the owner's prune and only
+        this hierarchy's ``values`` need remapping.  Without structure
+        sharing there is no activity signal on the color side, so pruning is
+        a no-op (the SDF-driven stats live in the SDF wrapper).
+        """
+        if not self.hierarchical_enabled:
+            return None
+        if self.hier_field.structure_owner is not None:
+            # Shared structure: follow the owner's schedule (the SDF wrapper
+            # owns the prune statistics and the iteration check).
+            if sdf_prune_info is None or not sdf_prune_info.get("changed"):
+                return None
+            info = self.hier_field.sync_from_owner_reband(sdf_prune_info)
+            if info.get("changed"):
+                self._register_sh_hooks()
+            return info
+        return None

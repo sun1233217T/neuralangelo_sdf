@@ -1365,6 +1365,61 @@ class HierarchicalBSplineField(nn.Module):
         }
 
     @torch.no_grad()
+    def prune_finest(self, keep_mask: torch.Tensor) -> dict[str, Any]:
+        """Shrink the finest level's region to ``region & keep_mask``.
+
+        Used for activity-based pruning: cells that never received any
+        refinement-marking signal (e.g. the interior "bubble web" no camera
+        ray ever crosses) are deactivated, falling back to the coarser
+        level's smoother field.  For THB the transfer preserves the field on
+        the retained domain.
+
+        ``keep_mask`` is a boolean (cc, cc, cc) tensor on the finest level's
+        cell lattice.  Returns the same info dict as :meth:`reband_finest`
+        so structure-sharing hierarchies can remap via
+        :meth:`sync_from_owner_reband`.
+        """
+        if self.num_levels < 2:
+            return {"changed": False, "reason": "need at least 2 levels"}
+
+        level_idx = self.num_levels - 1
+        level = self.levels[level_idx]
+        p = self.spline_degree
+
+        new_region = level.region & keep_mask.to(level.region.device)
+        if torch.equal(new_region, level.region):
+            return {"changed": False}
+
+        to_remove = int((level.region & ~new_region).sum())
+        old_index_grid = level.index_grid.clone()
+
+        transfer = None
+        if self.transfer_mode == "thb":
+            transfer = self._thb_full_transfer(level_idx - 1)
+
+        new_active = basis_support_mask(new_region, p)
+        if not bool(new_active.any()):
+            # An empty active set disconnects this level's values from the
+            # autograd graph (evaluation skips empty levels), which breaks
+            # CUDA-graph capture and freezes the level.  Refuse to prune.
+            return {"changed": False, "reason": "prune would empty the level"}
+        level.rebuild(new_region, new_active, transferred_values=transfer,
+                      carry_over=True)
+
+        if self.transfer_mode == "thb":
+            omegas = self._omegas()
+            for idx, lv in enumerate(self.levels):
+                lv.update_omega(omegas[idx])
+
+        return {
+            "changed": True,
+            "added": 0,
+            "removed": to_remove,
+            "old_index_grid": old_index_grid,
+            "level_idx": level_idx,
+        }
+
+    @torch.no_grad()
     def sync_from_owner_reband(self, reband_info: dict[str, Any]) -> dict[str, Any]:
         """Remap values after the owner hierarchy re-banded the finest level.
 
