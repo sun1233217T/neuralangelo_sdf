@@ -1,0 +1,6 @@
+# X4: DTU scan37 (scissors) 500k full run.
+# X3 at 150k: 27.32 — thin blades continuous but lace-like.
+_parent_: projects/Bspline-Neus/configs/stage_search/X2_scan55_500k.yaml
+
+data:
+    root: datasets/DTU/scan37

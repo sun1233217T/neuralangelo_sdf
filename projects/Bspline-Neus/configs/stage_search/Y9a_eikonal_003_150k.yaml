@@ -1,0 +1,27 @@
+# Y9a: office0 eikonal 0.03 (150k quick validation).
+# Background: every run in this project inherited eikonal=0.0005 from
+# dtu_scan24_bspline_neus.yaml — 200x below the NeuS default (0.1, kept in
+# base.yaml).  The only prior test (E24b, 50k, PSNR-only) is weak evidence.
+# Eikonal is the only "true distance field" constraint; cloudy geometry,
+# noisy normals and zc-depth holes are all consistent with it being too weak.
+# Schedule: L0 gets +10k over the 150k standard (per user): [20k,40k,80k,110k].
+_parent_: projects/Bspline-Neus/configs/stage_search/Y6_replica_office0_s2_500k.yaml
+
+max_iter: 150000
+validation_iter: 50000
+
+trainer:
+    loss_weight:
+        eikonal: 0.03
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                refine_iters: [20000, 40000, 80000, 110000]
+                prune_iters: [115000]
+                prune_margin: 3
+
+optim:
+    sched:
+        two_steps: [100000, 130000]

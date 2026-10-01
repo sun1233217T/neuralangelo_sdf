@@ -1,0 +1,4 @@
+# T4: 500k full run = T2 (fraction 0.2 + prune@200k/350k + thin_shell 0.1)
+# + per-level inv_std (now the code default for hierarchical models, with
+# parent-level inheritance at each refine).  T3b at 150k: 30.42 vs T1 30.31.
+_parent_: projects/Bspline-Neus/configs/stage_search/T2_thin_prune_500k.yaml

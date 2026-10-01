@@ -1,0 +1,21 @@
+# Y14: NeRF-synthetic lego, 500k full run.  Y13 at 150k: train 31.02 /
+# test 27.77 — method confirmed on clean object-centric synthetic data.
+# Data-informed schedule [40k,60k,100k,150k] (saturation analysis of Y6/Y7).
+# If Y14 is good, this config is the template for multi-GPU batch runs on
+# the remaining blender scenes (chair/drums/ficus/hotdog/materials/mic/ship).
+_parent_: projects/Bspline-Neus/configs/stage_search/Y13_lego_150k.yaml
+
+max_iter: 500000
+validation_iter: 50000
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                refine_iters: [40000, 60000, 100000, 150000]
+                prune_iters: [200000, 350000]
+                prune_margin: 3
+
+optim:
+    sched:
+        two_steps: [300000, 400000]

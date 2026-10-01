@@ -50,6 +50,7 @@ class GraphTrainStep:
         self.capture_iter = int(cfg_graph.get("capture_iter", 0))
         self.graphed = None
         self.static_in = dict()
+        self.input_keys = list(self.INPUT_KEYS)
         self.failed = False  # permanent fallback to eager
 
     def invalidate(self):
@@ -70,9 +71,12 @@ class GraphTrainStep:
             super().__init__()
             self.model = model
 
-        def forward(self, pose, intr, intr_inv, idx, ray_idx, image_sampled):
+        def forward(self, pose, intr, intr_inv, idx, ray_idx, image_sampled,
+                    mask_sampled=None):
             d = {"pose": pose, "intr": intr, "intr_inv": intr_inv, "idx": idx,
                  "ray_idx": ray_idx, "image_sampled": image_sampled}
+            if mask_sampled is not None:
+                d["mask_sampled"] = mask_sampled
             d.update(self.model(d))
             # Loss-guided refinement statistics: scatter this batch's render
             # error into the finest level's cell grid.  The accumulation is an
@@ -90,7 +94,13 @@ class GraphTrainStep:
             flat = d["rgb"].sum() * 0.0
             dists_d = d["dists"].to(d["rgb"].dtype) + flat
             weights_d = d["weights"].to(d["rgb"].dtype) + flat
-            return d["rgb"], d["gradients"], d["hessians"], outside_d, d["sdfs"], dists_d, weights_d
+            # Sample positions (for weak-region masking); zero-gradient path.
+            if "hier_points" in d:
+                pts_d = d["hier_points"].to(d["rgb"].dtype) + flat
+            else:
+                pts_d = flat  # placeholder, unused
+            return (d["rgb"], d["gradients"], d["hessians"], outside_d, d["sdfs"],
+                    dists_d, weights_d, pts_d)
 
     def _capture(self, data):
         trainer = self.trainer
@@ -103,8 +113,12 @@ class GraphTrainStep:
                 float(getattr(model, "progress", 0.0) or 0.0), device=device)
         trainer.progress = model.progress
 
-        self.static_in = {k: data[k].clone() for k in self.INPUT_KEYS}
-        args = tuple(self.static_in[k] for k in self.INPUT_KEYS)
+        keys = list(self.INPUT_KEYS)
+        if "mask_sampled" in data:
+            keys.append("mask_sampled")
+        self.input_keys = keys
+        self.static_in = {k: data[k].clone() for k in keys}
+        args = tuple(self.static_in[k] for k in keys)
         module = self._StepModule(model)
         # Side-stream warmup, then capture immediately.
         side = torch.cuda.Stream()
@@ -138,7 +152,7 @@ class GraphTrainStep:
                 try:
                     model = trainer.model_module
                     diag = self._StepModule(model)
-                    outs = diag(*tuple(self.static_in[k] for k in self.INPUT_KEYS))
+                    outs = diag(*tuple(self.static_in[k] for k in self.input_keys))
                     total = sum(o.float().sum() for o in outs if o is not None)
                     params = [p for p in diag.parameters() if p.requires_grad]
                     grads = torch.autograd.grad(total, params, allow_unused=True)
@@ -154,10 +168,10 @@ class GraphTrainStep:
                 return False
 
         # Load this iteration's batch into the static input buffers.
-        for k in self.INPUT_KEYS:
+        for k in self.input_keys:
             self.static_in[k].copy_(data[k], non_blocking=True)
-        rgb, gradients, hessians, outside_d, sdfs, dists_d, weights_d = self.graphed(
-            *tuple(self.static_in[k] for k in self.INPUT_KEYS))
+        rgb, gradients, hessians, outside_d, sdfs, dists_d, weights_d, pts_d = self.graphed(
+            *tuple(self.static_in[k] for k in self.input_keys))
 
         # Losses stay eager so the current schedule weights apply.
         target = self.static_in["image_sampled"]
@@ -174,13 +188,33 @@ class GraphTrainStep:
             total = total + losses["curvature"] * trainer.weights["curvature"]
         if "mean_curvature" in trainer.weights:
             losses["mean_curvature"] = trainer._mean_curvature_loss(
-                gradients, hessians, sdfs, outside=outside)
+                gradients, hessians, sdfs, outside=outside,
+                points=pts_d if pts_d.dim() >= 2 else None)
             total = total + losses["mean_curvature"] * trainer.weights["mean_curvature"]
         if "thin_shell" in trainer.weights:
             n_obj = gradients.shape[2]
             losses["thin_shell"] = trainer._thin_shell_loss(
                 sdfs, dists_d[:, :, :n_obj], weights_d[:, :, :n_obj])
             total = total + losses["thin_shell"] * trainer.weights["thin_shell"]
+        if "depth" in trainer.weights and "depth_sampled" in data:
+            # GT depth supervision (Replica): L1 between the composited ray
+            # distance and the dataset's GT ray distance (normalized units).
+            n_obj = gradients.shape[2]
+            depth_pred = (weights_d[:, :, :n_obj, 0] * dists_d[:, :, :n_obj, 0]).sum(dim=-1)  # (B,R)
+            depth_target = data["depth_sampled"].to(depth_pred.dtype)
+            valid = depth_target > 0
+            if valid.any():
+                losses["depth"] = torch_F.l1_loss(depth_pred[valid], depth_target[valid])
+                total = total + losses["depth"] * trainer.weights["depth"]
+        if "mask" in trainer.weights and "mask_sampled" in self.static_in:
+            # Mask supervision: background rays (mask=0) must carry zero
+            # opacity inside the object volume — no free floating shells on
+            # black ground-truth backgrounds.
+            n_obj = gradients.shape[2]
+            opacity_obj = weights_d[:, :, :n_obj, 0].sum(dim=-1)  # (B,R)
+            bg = (self.static_in["mask_sampled"] < 0.5).to(opacity_obj.dtype)
+            losses["mask"] = (opacity_obj.pow(2) * bg).sum() / (bg.sum() + 1e-8)
+            total = total + losses["mask"] * trainer.weights["mask"]
         losses["total"] = total
         trainer.losses.clear()
         trainer.losses.update(losses)

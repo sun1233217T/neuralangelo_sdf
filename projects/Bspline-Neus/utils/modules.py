@@ -140,10 +140,22 @@ class BSplineSDFWrapper(nn.Module):
 
         # Inverse standard deviation in log-space.
         raw_inv_std = math.log(math.expm1(float(cfg_bspline.sdf_inv_s_init)))
-        self.register_parameter(
-            "raw_sdf_inv_std",
-            nn.Parameter(torch.tensor(raw_inv_std, dtype=torch.get_default_dtype())),
-        )
+        if self.hierarchical_enabled:
+            # Per-level NeuS sharpness (T3): each hierarchy level learns its
+            # own inverse std.  inv_std_grad_analysis showed converged (L4)
+            # regions push inv_std up while unconverged coarse regions push
+            # it down; a single global s settles at a compromise.  Per-level
+            # parameters let each region converge to its own optimum.
+            self.register_parameter(
+                "raw_sdf_inv_std_levels",
+                nn.Parameter(torch.full((max_levels,), raw_inv_std,
+                                        dtype=torch.get_default_dtype())),
+            )
+        else:
+            self.register_parameter(
+                "raw_sdf_inv_std",
+                nn.Parameter(torch.tensor(raw_inv_std, dtype=torch.get_default_dtype())),
+            )
 
         if not self.hierarchical_enabled:
             # Stateless field object used for evaluation.  The actual learnable
@@ -199,7 +211,15 @@ class BSplineSDFWrapper(nn.Module):
         coords_1d = [lower[d] + step[d] * torch.arange(grid_size, dtype=torch.float64) for d in range(3)]
         gx, gy, gz = torch.meshgrid(*coords_1d, indexing="ij")
         pts = torch.stack([gx, gy, gz], dim=-1)
-        sdf = torch.linalg.norm(pts - center, dim=-1) - radius
+        if bool(getattr(cfg_bspline, "sdf_init_inverted", False)):
+            # Inverted shell for indoor/inside-out scenes: positive inside
+            # the room (air), negative outside the shell (solid).  Rays from
+            # a camera inside the room then see the SDF *decrease* through
+            # the wall — the direction NeuS's alpha rule requires — instead
+            # of starting from a tiny positive-everywhere ball at the origin.
+            sdf = radius - torch.linalg.norm(pts - center, dim=-1)
+        else:
+            sdf = torch.linalg.norm(pts - center, dim=-1) - radius
         sdf = sdf.clamp(-2.0 * radius, 2.0 * radius)
         return sdf.to(dtype=dtype, device=device)
 
@@ -300,12 +320,41 @@ class BSplineSDFWrapper(nn.Module):
         return sdf.to(dtype=dtype, device=device)
 
     def inv_std(self) -> torch.Tensor:
-        s = F.softplus(self.raw_sdf_inv_std)
+        if self.hierarchical_enabled:
+            # Scalar view for logging/legacy callers: the finest level's s.
+            s = F.softplus(self.raw_sdf_inv_std_levels[-1])
+        else:
+            s = F.softplus(self.raw_sdf_inv_std)
         if self.inv_s_floor is not None:
             s = s.clamp_min(float(self.inv_s_floor))
         if self.inv_s_ceil is not None:
             s = s.clamp_max(float(self.inv_s_ceil))
         return s
+
+    def inv_std_at(self, points_3D) -> torch.Tensor:
+        """Per-sample NeuS sharpness: the finest covering level's inv_std.
+
+        Points outside every refined region use level 0.  The level index is
+        detached (region lookup), so the gradient flows only into the
+        covering level's own ``raw_sdf_inv_std_levels`` entry — coarse
+        regions can no longer hijack the fine level's sharpness.
+        """
+        if not self.hierarchical_enabled:
+            return self.inv_std()
+        pts = self._clamp_points(points_3D)
+        s_levels = F.softplus(self.raw_sdf_inv_std_levels)
+        if self.inv_s_floor is not None:
+            s_levels = s_levels.clamp_min(float(self.inv_s_floor))
+        if self.inv_s_ceil is not None:
+            s_levels = s_levels.clamp_max(float(self.inv_s_ceil))
+        lvl = torch.zeros(pts.shape[:-1], dtype=torch.long, device=pts.device)
+        for li in range(1, self.hier_field.num_levels):
+            lv = self.hier_field.levels[li]
+            cc = lv.cell_count
+            idx = ((pts - lv._lower) / lv.step).floor().long().clamp(0, cc - 1)
+            hit = lv.region[idx[..., 0], idx[..., 1], idx[..., 2]]
+            lvl = torch.where(hit, li, lvl)
+        return s_levels[lvl]
 
     def _prepare_field(self):
         self._field.control_grid = self.raw_sdf_grid
@@ -795,6 +844,15 @@ class BSplineSDFWrapper(nn.Module):
         # so old hooks are on dead parameters.
         if self.grad_marking_enabled and info.get("refined"):
             self._register_grad_hooks()
+        # Per-level inv_std inheritance: the newly created level starts from
+        # the previous finest level's converged sharpness, not the original
+        # init value (otherwise it needs many iterations to re-sharpen, as
+        # seen in T3 where L4's inv_std only reached 9.5 vs the global 94).
+        if info.get("refined") and hasattr(self, "raw_sdf_inv_std_levels"):
+            new_idx = self.hier_field.num_levels - 1
+            with torch.no_grad():
+                self.raw_sdf_inv_std_levels[new_idx] = \
+                    self.raw_sdf_inv_std_levels[new_idx - 1].clone()
         return info
 
     @torch.no_grad()
@@ -861,6 +919,38 @@ class BSplineSDFWrapper(nn.Module):
             )
             print(f"[Bspline-Neus] reband_all at iter {iteration}: {stats}")
         return info
+
+    @torch.no_grad()
+    def weak_mask_at(self, points_3D, margin=3):
+        """Per-sample weak-observation mask (1 = weakly observed cell).
+
+        A cell is weakly observed when no refinement anchor ever hit it
+        (``_loss_count == 0`` after a dilation of ``margin`` cells, so the
+        deg-2 support ring of every hit cell stays protected).  Used by the
+        weak-region-only mean-curvature penalty: smoothing is applied only
+        where photometric evidence is too sparse to support detail anyway.
+
+        Falls back to all-zeros (nothing is weak) when no statistics exist.
+        """
+        if not self.hierarchical_enabled:
+            return torch.zeros(points_3D.shape[:-1], device=points_3D.device)
+        level = self.hier_field.levels[-1]
+        cc = level.cell_count
+        if (
+            self._loss_count is None
+            or tuple(self._loss_count.shape) != (cc,) * 3
+        ):
+            return torch.zeros(points_3D.shape[:-1], device=points_3D.device)
+        live = (self._loss_count > 0).float()[None, None]
+        if margin > 0:
+            hit = F.max_pool3d(live, kernel_size=2 * margin + 1, stride=1,
+                               padding=margin)[0, 0] > 0
+        else:
+            hit = live[0, 0] > 0
+        pts = self._clamp_points(points_3D)
+        idx = ((pts - level._lower) / level.step).floor().long().clamp(0, cc - 1)
+        strong = hit[idx[..., 0], idx[..., 1], idx[..., 2]]
+        return (~strong).to(points_3D.dtype)
 
     @torch.no_grad()
     def maybe_prune(self, iteration):

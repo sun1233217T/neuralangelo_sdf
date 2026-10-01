@@ -1,0 +1,15 @@
+# Y6: Replica office0, stride-2 (1000 frames) + native 680x1200, 500k full.
+# Doubles as the refine-timing diagnostic run: trainer now writes
+# loss_curve.csv every 100 iters (loss components + per-level grad RMS),
+# so this run's curve is the data for the plateau/refine-timing analysis.
+# Standard refine schedule [10k,30k,70k,150k] under evaluation.
+_parent_: projects/Bspline-Neus/configs/stage_search/T4_perlevel_invstd_500k.yaml
+
+data:
+    root: datasets/Replica/Replica/office0_s2
+    auto_bounds:
+        enabled: false
+    train:
+        image_size: [680, 1200]
+    val:
+        image_size: [680, 1200]

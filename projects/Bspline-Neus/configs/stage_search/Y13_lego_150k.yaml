@@ -1,0 +1,22 @@
+# Y13: NeRF-synthetic lego, 150k. Cleanest possible test bed:
+# synthetic object-centric, white background, 100 train / 200 TRUE test views.
+# Fallback after T&T raw was blocked (NSVF images are cropped/zoomed, poses
+# only match the cropped versions).
+_parent_: projects/Bspline-Neus/configs/stage_search/Y9a_eikonal_003_150k.yaml
+
+data:
+    root: datasets/nerf_synthetic/lego
+    auto_bounds:
+        enabled: false
+    train:
+        image_size: [800, 800]
+    val:
+        image_size: [800, 800]
+
+model:
+    background:
+        white: true
+
+trainer:
+    loss_weight:
+        eikonal: 0.0005

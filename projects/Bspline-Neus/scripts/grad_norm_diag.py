@@ -112,7 +112,10 @@ def main():
             accs[(comp, f"sdf_L{l}")] = GradAccumulator([sdf_hier.levels[l].values])
             accs[(comp, f"rgb_L{l}")] = GradAccumulator([rgb_hier.levels[l].values])
         accs[(comp, "mlp")] = GradAccumulator(model.neural_rgb._mlp.parameters())
-        accs[(comp, "inv_std")] = GradAccumulator([model.neural_sdf.raw_sdf_inv_std])
+        _p = getattr(model.neural_sdf, "raw_sdf_inv_std_levels", None)
+        if _p is None:
+            _p = model.neural_sdf.raw_sdf_inv_std
+        accs[(comp, "inv_std")] = GradAccumulator([_p])
 
     # Use the run's actual weights; the saved E22b config uses eikonal=0.0005.
     # Hard-coding 0.1 overstated its contribution by 200x.

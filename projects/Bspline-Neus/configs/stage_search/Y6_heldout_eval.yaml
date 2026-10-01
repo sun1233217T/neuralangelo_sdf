@@ -1,0 +1,8 @@
+# Held-out novel-view evaluation for Y6 (stride-2 offset-1, 1000 unseen views).
+# Normalization identical to the Y6 training json.
+_parent_: projects/Bspline-Neus/configs/stage_search/Y6_replica_office0_s2_500k.yaml
+
+data:
+    root: datasets/Replica/Replica/office0_s2_heldout
+    val:
+        subset: 25

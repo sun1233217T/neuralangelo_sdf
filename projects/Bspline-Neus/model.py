@@ -105,10 +105,19 @@ class Model(NeuralangeloModel):
         dist_far.masked_fill_(outside, 1.2)
         return dist_near, dist_far, outside
 
-    def compute_neus_alphas(self, ray_unit, sdfs, gradients, dists, dist_far=None, progress=1., eps=1e-5):
-        """NeuS alpha computation using the B-spline SDF inverse std."""
+    def compute_neus_alphas(self, ray_unit, sdfs, gradients, dists, dist_far=None, progress=1., eps=1e-5,
+                            points=None):
+        """NeuS alpha computation using the B-spline SDF inverse std.
+
+        When ``points`` are provided and the field is hierarchical, the
+        per-level inv_std is evaluated at every sample (finest covering
+        level); otherwise the scalar inv_std is broadcast as before.
+        """
         sdfs = sdfs[..., 0]  # [B,R,N]
-        inv_s = self.neural_sdf.inv_std()
+        if points is not None and getattr(self.neural_sdf, "hierarchical_enabled", False):
+            inv_s = self.neural_sdf.inv_std_at(points)  # [B,R,N]
+        else:
+            inv_s = self.neural_sdf.inv_std()
         true_cos = (ray_unit[..., None, :] * gradients).sum(dim=-1, keepdim=False)  # [B,R,N]
         iter_cos = self._get_iter_cos(true_cos, progress=progress)  # [B,R,N]
         if dist_far is None:
@@ -281,6 +290,16 @@ class Model(NeuralangeloModel):
         exact.
         """
         restored = False
+        # Migrate pre-T3 checkpoints: the scalar inv_std becomes per-level.
+        for prefix in ("neural_sdf.", "module.neural_sdf."):
+            old_key = f"{prefix}raw_sdf_inv_std"
+            new_key = f"{prefix}raw_sdf_inv_std_levels"
+            if old_key in state_dict and new_key not in state_dict:
+                old = state_dict[old_key]
+                levels = self.neural_sdf.hier_field.max_levels if \
+                    getattr(self.neural_sdf, "hierarchical_enabled", False) else 1
+                state_dict[new_key] = old.reshape(()).expand(levels).clone()
+            state_dict.pop(old_key, None)
         for mod_name in ("neural_sdf", "neural_rgb"):
             field = getattr(getattr(self, mod_name, None), "hier_field", None)
             if field is None:

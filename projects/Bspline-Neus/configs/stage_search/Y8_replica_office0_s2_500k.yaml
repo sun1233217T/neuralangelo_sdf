@@ -1,0 +1,12 @@
+# Y8: Replica office0 stride-2 native, 500k, data-informed schedule.
+# Refine-timing evidence (Y6+Y7 saturation analysis): L0 saturates at ~41k;
+# each later level absorbs its residual in ~10-15k after refine; inv_std only
+# trains meaningfully during the L4 phase (~0.02/10k — needs the long tail).
+# Schedule per user decision: L0 40k / L1 20k / L2 40k / L3 50k / L4 350k.
+_parent_: projects/Bspline-Neus/configs/stage_search/Y6_replica_office0_s2_500k.yaml
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                refine_iters: [40000, 60000, 100000, 150000]

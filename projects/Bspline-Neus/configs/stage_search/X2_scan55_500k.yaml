@@ -1,0 +1,6 @@
+# scan55 (stone rabbit) 500k full run — complete T4 stack.
+# X1 at 150k: 32.16 (vs scan24's 30.42 at the same budget).
+_parent_: projects/Bspline-Neus/configs/stage_search/T4_perlevel_invstd_500k.yaml
+
+data:
+    root: datasets/DTU/scan55

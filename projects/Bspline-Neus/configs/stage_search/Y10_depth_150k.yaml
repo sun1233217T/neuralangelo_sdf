@@ -1,0 +1,17 @@
+# Y10: office0 + GT depth supervision (150k diagnostic).
+# Question: is the broken geometry a supervision problem (RGB-only) or a
+# representation problem?  Replica provides exact GT depth (16-bit PNGs,
+# scale 6553.5).  Depth loss = L1 on composited ray distance, weight 0.1.
+# Everything else identical to the Y9 150k setup for clean attribution.
+_parent_: projects/Bspline-Neus/configs/stage_search/Y9a_eikonal_003_150k.yaml
+
+data:
+    depth:
+        enabled: true
+        scale: 6553.5
+        max_norm: 1.95
+
+trainer:
+    loss_weight:
+        eikonal: 0.0005
+        depth: 1.0

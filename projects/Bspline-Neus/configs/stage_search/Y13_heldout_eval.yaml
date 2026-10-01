@@ -1,0 +1,7 @@
+# Held-out evaluation for Y13: the blender test split (200 views never trained).
+_parent_: projects/Bspline-Neus/configs/stage_search/Y13_lego_150k.yaml
+
+data:
+    root: datasets/nerf_synthetic/lego_heldout
+    val:
+        subset: 25

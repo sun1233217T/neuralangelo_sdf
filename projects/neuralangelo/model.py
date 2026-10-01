@@ -172,7 +172,7 @@ class Model(BaseModel):
         rgbs = self.neural_rgb.forward(points, normals, rays_unit, feats, app=app)  # [B,R,N,3]
         # SDF volume rendering.
         alphas = self.compute_neus_alphas(ray_unit, sdfs, gradients, dists, dist_far=far[..., None],
-                                          progress=self.progress)  # [B,R,N]
+                                          progress=self.progress, points=points)  # [B,R,N]
         if not self.training:
             weights = render.alpha_compositing_weights(alphas)  # [B,R,N,1]
             opacity = render.composite(1., weights)  # [B,R,1]
@@ -281,7 +281,11 @@ class Model(BaseModel):
         dists = far[..., None] / (inv_dists + eps)  # [B,R,N,1]
         return dists
 
-    def compute_neus_alphas(self, ray_unit, sdfs, gradients, dists, dist_far=None, progress=1., eps=1e-5):
+    def compute_neus_alphas(self, ray_unit, sdfs, gradients, dists, dist_far=None, progress=1., eps=1e-5,
+                            points=None):
+        # ``points`` is accepted for subclass overrides that evaluate a
+        # spatially varying inv_std (Bspline-Neus per-level sharpness); the
+        # base implementation uses a single scalar and ignores it.
         sdfs = sdfs[..., 0]  # [B,R,N]
         # SDF volume rendering in NeuS.
         inv_s = self.s_var.exp()

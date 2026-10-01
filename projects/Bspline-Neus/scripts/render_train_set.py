@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -197,11 +198,31 @@ def main():
 
             for b in range(data["image"].shape[0]):
                 sample_idx = int(data["idx"][b].cpu())
+                out_png = out_dir / f"train{sample_idx:02d}_compare.png"
+                if out_png.exists():
+                    # Resume support: skip images already rendered.
+                    continue
                 gt = _to_np(data["image"][b])  # [3,H,W]
                 rd = _to_np(output["rgb_map"][b])  # [3,H,W]
                 opacity = _to_np(output["opacity_map"][b])  # [1,H,W]
                 if opacity.ndim == 3:
                     opacity = opacity[0]
+                # Depth (normalized within opaque region, near=bright) and
+                # analytic-gradient normal maps for geometric inspection.
+                depth = _to_np(output["depth_map"][b])  # [1,H,W]
+                if depth.ndim == 3:
+                    depth = depth[0]
+                normal = _to_np(output["normal_map"][b])  # [3,H,W]
+                oq = opacity > 0.5
+                depth_v = np.zeros_like(depth)
+                if oq.any():
+                    lo, hi = depth[oq].min(), depth[oq].max()
+                    depth_v[oq] = 1.0 - (depth[oq] - lo) / (hi - lo + 1e-8)
+                Image.fromarray((np.clip(depth_v, 0, 1) * 255).astype(np.uint8)).save(
+                    out_dir / f"train{sample_idx:02d}_depth.png")
+                Image.fromarray((np.clip(normal.transpose(1, 2, 0) * 0.5 + 0.5, 0, 1)
+                                 * 255).astype(np.uint8)).save(
+                    out_dir / f"train{sample_idx:02d}_normal.png")
 
                 fg_mask = get_fg_mask(sample_idx, gt, opacity, dataset, root)
                 out_png = out_dir / f"train{sample_idx:02d}_compare.png"
