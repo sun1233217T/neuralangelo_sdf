@@ -48,6 +48,11 @@ class GraphTrainStep:
         # backward in that shape regime... in practice: capture at iter 0 and
         # re-capture immediately after each refinement.
         self.capture_iter = int(cfg_graph.get("capture_iter", 0))
+        # The multi-view consistency loss runs inside the captured step when
+        # enabled (the neighbor-camera inputs become extra static buffers).
+        self.with_consistency = (
+            float(getattr(trainer.cfg.trainer.loss_weight, "consistency", 0.0) or 0.0) > 0
+        )
         self.graphed = None
         self.static_in = dict()
         self.input_keys = list(self.INPUT_KEYS)
@@ -67,12 +72,17 @@ class GraphTrainStep:
     class _StepModule(torch.nn.Module):
         """nn.Module wrapper so MGC can discover the parameters."""
 
-        def __init__(self, model):
+        def __init__(self, model, trainer=None):
             super().__init__()
             self.model = model
+            self.trainer = trainer
 
         def forward(self, pose, intr, intr_inv, idx, ray_idx, image_sampled,
-                    mask_sampled=None):
+                    npose=None, nintr=None, nintr_inv=None, mask_sampled=None):
+            # NOTE: the optional trailing arguments are passed POSITIONALLY by
+            # ``make_graphed_callables`` in the order of ``self.input_keys``:
+            # the consistency keys come before ``mask_sampled``.  Keep the
+            # signature order in sync with ``GraphTrainStep._capture``.
             d = {"pose": pose, "intr": intr, "intr_inv": intr_inv, "idx": idx,
                  "ray_idx": ray_idx, "image_sampled": image_sampled}
             if mask_sampled is not None:
@@ -99,8 +109,17 @@ class GraphTrainStep:
                 pts_d = d["hier_points"].to(d["rgb"].dtype) + flat
             else:
                 pts_d = flat  # placeholder, unused
-            return (d["rgb"], d["gradients"], d["hessians"], outside_d, d["sdfs"],
-                    dists_d, weights_d, pts_d)
+            outputs = (d["rgb"], d["gradients"], d["hessians"], outside_d, d["sdfs"],
+                       dists_d, weights_d, pts_d)
+            if npose is not None:
+                # Multi-view zero-crossing depth consistency, computed inside
+                # the captured step so its launch overhead is replayed away.
+                # The raw (unweighted) value is returned; the weight is
+                # applied eagerly so schedule changes stay outside the graph.
+                d["npose"], d["nintr"], d["nintr_inv"] = npose, nintr, nintr_inv
+                cons = self.trainer._consistency_loss(d)
+                outputs = outputs + (cons,)
+            return outputs
 
     def _capture(self, data):
         trainer = self.trainer
@@ -114,12 +133,14 @@ class GraphTrainStep:
         trainer.progress = model.progress
 
         keys = list(self.INPUT_KEYS)
+        if self.with_consistency and "npose" in data:
+            keys.extend(("npose", "nintr", "nintr_inv"))
         if "mask_sampled" in data:
             keys.append("mask_sampled")
         self.input_keys = keys
         self.static_in = {k: data[k].clone() for k in keys}
         args = tuple(self.static_in[k] for k in keys)
-        module = self._StepModule(model)
+        module = self._StepModule(model, trainer)
         # Side-stream warmup, then capture immediately.
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
@@ -151,7 +172,7 @@ class GraphTrainStep:
                 # touched by the capture batch).
                 try:
                     model = trainer.model_module
-                    diag = self._StepModule(model)
+                    diag = self._StepModule(model, trainer)
                     outs = diag(*tuple(self.static_in[k] for k in self.input_keys))
                     total = sum(o.float().sum() for o in outs if o is not None)
                     params = [p for p in diag.parameters() if p.requires_grad]
@@ -162,6 +183,9 @@ class GraphTrainStep:
                     print(f"[graph] capture diagnostic failed: {diag_exc}")
                 print(f"[graph] capture FAILED ({type(exc).__name__}: {exc}); "
                       "falling back to eager training permanently")
+                print("[graph] " + "!" * 66)
+                print("[graph] !!! EAGER FALLBACK IS ~3x SLOWER — FIX THE CAPTURE !!!")
+                print("[graph] " + "!" * 66)
                 self.failed = True
                 self.graphed = None
                 torch.cuda.synchronize()
@@ -170,8 +194,11 @@ class GraphTrainStep:
         # Load this iteration's batch into the static input buffers.
         for k in self.input_keys:
             self.static_in[k].copy_(data[k], non_blocking=True)
-        rgb, gradients, hessians, outside_d, sdfs, dists_d, weights_d, pts_d = self.graphed(
-            *tuple(self.static_in[k] for k in self.input_keys))
+        outputs = self.graphed(*tuple(self.static_in[k] for k in self.input_keys))
+        cons_raw = None
+        if self.with_consistency and len(outputs) == 9:
+            *outputs, cons_raw = outputs
+        (rgb, gradients, hessians, outside_d, sdfs, dists_d, weights_d, pts_d) = outputs
 
         # Losses stay eager so the current schedule weights apply.
         target = self.static_in["image_sampled"]
@@ -215,6 +242,11 @@ class GraphTrainStep:
             bg = (self.static_in["mask_sampled"] < 0.5).to(opacity_obj.dtype)
             losses["mask"] = (opacity_obj.pow(2) * bg).sum() / (bg.sum() + 1e-8)
             total = total + losses["mask"] * trainer.weights["mask"]
+        if cons_raw is not None and "consistency" in trainer.weights:
+            # Raw consistency loss computed inside the captured step; the
+            # weight is applied here so it stays schedule-dependent.
+            losses["consistency"] = cons_raw
+            total = total + cons_raw * trainer.weights["consistency"]
         losses["total"] = total
         trainer.losses.clear()
         trainer.losses.update(losses)

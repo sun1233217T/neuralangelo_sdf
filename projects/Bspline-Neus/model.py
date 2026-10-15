@@ -154,6 +154,13 @@ class Model(NeuralangeloModel):
         """
         output = super().render_rays(center, ray_unit, sample_idx=sample_idx,
                                      stratified=stratified)
+        if self.training:
+            # Exposed for the multi-view zero-crossing depth consistency loss
+            # (eager path only): the loss reprojects the source-view zero
+            # crossing into a neighbor camera and needs the exact rays used
+            # by this render call.
+            output["center"] = center
+            output["ray_unit"] = ray_unit
         if self.training and getattr(self.neural_sdf, "loss_marking_enabled", False):
             n_obj = output["gradients"].shape[2]
             dists_obj = output["dists"][:, :, :n_obj]  # [B,R,No,1]

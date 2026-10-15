@@ -1,0 +1,8 @@
+# Z5b: ficus + mask + multi-view zero-crossing depth consistency, 500k.
+# Retry of Z5 (consistency-only) which regressed to 25.59 dB (-0.69) with
+# background junk surfaces.  Masks now generated from the RGBA alpha; with
+# the silhouette constrained, consistency should only act on the plant.
+_parent_: projects/Bspline-Neus/configs/stage_search/Z6_hotdog_500k.yaml
+
+data:
+    root: datasets/nerf_synthetic/ficus

@@ -19,7 +19,28 @@ import os
 
 import pynvml
 
-pynvml.nvmlInit()
+
+def _nvml_init_with_fallback():
+    """Initialize NVML, falling back to the System32 copy of nvml.dll.
+
+    Older pynvml only probes ``%ProgramFiles%/NVIDIA Corporation/NVSMI``,
+    but newer NVIDIA drivers install nvml.dll into System32 instead, so the
+    probe fails on updated Windows boxes.  Pre-loading the System32 library
+    into ``pynvml.nvmlLib`` makes ``nvmlInit`` skip its own path probe.
+    """
+    try:
+        pynvml.nvmlInit()
+    except pynvml.NVMLError:
+        import ctypes
+        system32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+        nvml_path = os.path.join(system32, "nvml.dll")
+        if not os.path.exists(nvml_path):
+            raise
+        pynvml.nvmlLib = ctypes.CDLL(nvml_path)
+        pynvml.nvmlInit()
+
+
+_nvml_init_with_fallback()
 
 
 def system_get_driver_version():

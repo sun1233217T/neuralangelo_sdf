@@ -1,0 +1,16 @@
+# Z6: hotdog + mask + multi-view zero-crossing depth consistency, 500k.
+# Hotdog ships no alpha mask — masks were generated from the RGBA alpha
+# (threshold 127) like the other blender scenes.  Mask (silhouette) +
+# consistency (interior) together; the ficus no-mask run (Z5) regressed
+# (-0.69 dB) with background junk, so mask supervision is mandatory for
+# consistency on these scenes.
+_parent_: projects/Bspline-Neus/configs/stage_search/Z3_ship_500k.yaml
+
+data:
+    root: datasets/nerf_synthetic/hotdog
+    mask:
+        enabled: true
+
+trainer:
+    loss_weight:
+        mask: 0.02

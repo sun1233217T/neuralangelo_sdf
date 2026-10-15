@@ -1,0 +1,24 @@
+# Z2: lego + mask + multi-view zero-crossing depth consistency, 500k full
+# run.  Direct counterpart of B_lego_500000 (mask-only) with the consistency
+# loss added; Z1 at 150k already matched its PSNR (-0.27 dB) while clearing
+# the internal fog.  Same schedule as Y14, plus cudagraph (the consistency
+# branch runs inside the captured step, overhead ~+3%).
+_parent_: projects/Bspline-Neus/configs/stage_search/Z1_consistency_150k.yaml
+
+max_iter: 500000
+validation_iter: 50000
+
+data:
+    root: datasets/nerf_synthetic/lego
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                refine_iters: [40000, 60000, 100000, 150000]
+                prune_iters: [200000, 350000]
+                prune_margin: 3
+
+optim:
+    sched:
+        two_steps: [300000, 400000]

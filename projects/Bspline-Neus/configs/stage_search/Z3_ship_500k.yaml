@@ -1,0 +1,17 @@
+# Z3: ship + multi-view zero-crossing depth consistency, 500k.
+# Ship showed the heaviest internal fog in the blender mask batch (whole
+# hull region was a mid-gray cloud).  NOTE: the ship dataset ships no
+# alpha masks (only drums/lego/materials/mic have mask/), so this run —
+# like B_ship_500000 — runs WITHOUT mask supervision; the consistency
+# loss (all rays, mask_only auto-degrades) is the fog-fighting mechanism.
+# Z2 on lego matched the mask-only PSNR while clearing the fog.
+_parent_: projects/Bspline-Neus/configs/stage_search/Z2_consistency_500k.yaml
+
+data:
+    root: datasets/nerf_synthetic/ship
+    mask:
+        enabled: false
+
+trainer:
+    loss_weight:
+        mask: 0.0

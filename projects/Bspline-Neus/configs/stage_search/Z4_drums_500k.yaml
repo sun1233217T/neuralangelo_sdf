@@ -1,0 +1,8 @@
+# Z4: drums + mask + multi-view zero-crossing depth consistency, 500k.
+# Drums has alpha masks and the fog between the drums/gap regions was the
+# typical interior-fog case.  Mask (silhouette) + consistency (interior)
+# together — the same combination that cleaned lego (Z2).
+_parent_: projects/Bspline-Neus/configs/stage_search/Z2_consistency_500k.yaml
+
+data:
+    root: datasets/nerf_synthetic/drums

@@ -12,6 +12,7 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import json
 import os
+import re
 import numpy as np
 import torch
 import torchvision.transforms.functional as torchvision_F
@@ -68,6 +69,13 @@ class Dataset(base.Dataset):
         # 16-bit depth PNGs next to the color frames).  When enabled,
         # training rays additionally carry per-ray GT depth converted to
         # ray distance in the model's normalized units.
+        # Optional multi-view consistency cameras: for each training sample,
+        # additionally expose one random neighbor view (different from idx)
+        # with its w2c pose and intrinsics.  The trainer uses them to enforce
+        # zero-crossing depth agreement across views (geometry-only, no
+        # color re-rendering), which suppresses cloudy unconstrained regions.
+        cons_cfg = getattr(cfg_data, "consistency", {})
+        self.use_consistency = bool(cons_cfg.get("enabled", False)) and self.split == "train"
         depth_cfg = getattr(cfg_data, "depth", {})
         self.use_depth = bool(depth_cfg.get("enabled", False)) and self.split == "train"
         self.depth_scale = float(depth_cfg.get("scale", 6553.5))  # raw -> meters
@@ -151,6 +159,14 @@ class Dataset(base.Dataset):
                 depth, _ = self.depths[idx] if self.preload else self.get_depth(idx)
                 depth_sampled = depth.flatten(0, 1)[ray_idx]  # [R]
                 sample.update(depth_sampled=depth_sampled)
+            if self.use_consistency:
+                num_frames = len(self.list)
+                if num_frames > 1:
+                    offset = int(torch.randint(1, num_frames, (1,)).item())
+                    nidx = (idx + offset) % num_frames
+                    nintr, npose = self.cameras[nidx] if self.preload else self.get_camera(nidx)
+                    nintr, npose = self.preprocess_camera(nintr, npose, image_size_raw)
+                    sample.update(npose=npose, nintr=nintr, nintr_inv=nintr.inverse())
         else:  # keep image during inference
             sample.update(
                 image=image,
@@ -171,7 +187,10 @@ class Dataset(base.Dataset):
     def get_mask(self, idx):
         """Load the object mask for frame ``idx`` (mask/{frame:03d}.png)."""
         fpath = self.list[idx]["file_path"]
-        frame_no = int(os.path.splitext(os.path.basename(fpath))[0])
+        stem = os.path.splitext(os.path.basename(fpath))[0]
+        # DTU names are plain integers (0000); blender names are r_<i>.
+        m = re.search(r"(\d+)$", stem)
+        frame_no = int(m.group(1))
         mask_fname = f"{self.root}/mask/{frame_no:03d}.png"
         mask = Image.open(mask_fname).convert("L")
         mask.load()

@@ -1,0 +1,8 @@
+# Z7: mic + mask + multi-view zero-crossing depth consistency, 500k.
+# Completeness run: mic was skipped earlier because the mask baseline was
+# already clean (no internal fog).  Included so the consistency comparison
+# table covers all fog-relevant blender scenes.
+_parent_: projects/Bspline-Neus/configs/stage_search/Z2_consistency_500k.yaml
+
+data:
+    root: datasets/nerf_synthetic/mic

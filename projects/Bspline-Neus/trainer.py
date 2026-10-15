@@ -195,6 +195,132 @@ class Trainer(NeuralangeloTrainer):
         # Fraction of all true flips that are invisible thin-shell pairs.
         return pen.sum() / (hard_flip.sum() + 1e-8)
 
+    def _consistency_loss(self, data):
+        """Multi-view zero-crossing depth consistency (self-supervised).
+
+        For each selected foreground ray, the SDF zero crossing seen by the
+        source camera is reprojected into a random neighbor view; the
+        neighbor ray must show its own zero crossing at the same camera
+        depth within a narrow window.  Only point SDF queries are issued on
+        the neighbor ray (no color re-rendering, no segment integration), so
+        the overhead is a small fraction of the volume-render pass.
+
+        Cloudy unconstrained regions — gaps between parts, haze inside
+        silhouettes — have zero crossings that disagree across views, and
+        this loss directly penalizes that disagreement.  Rays whose neighbor
+        window contains no crossing at all get a soft ``pull the closest
+        sample toward the surface`` penalty instead of being ignored.
+        """
+        p = getattr(self.cfg.trainer, "consistency_params", {})
+        max_rays = int(getattr(p, "num_rays", 512))
+        num_samples = int(getattr(p, "num_samples", 33))
+        window = float(getattr(p, "window", 0.15))
+        mask_only = bool(getattr(p, "mask_only", True))
+        no_surface_weight = float(getattr(p, "no_surface_weight", 0.1))
+
+        sdf_field = self.model_module.neural_sdf
+        sdfs = data["sdfs"]                                    # [B,R,No]
+        dists = data["dists"][..., 0][:, :, :sdfs.shape[2]]    # [B,R,No]
+        center = data["center"]                                # [B,R,3]
+        ray_unit = data["ray_unit"]                            # [B,R,3]
+        B, R, N = sdfs.shape
+        device = sdfs.device
+
+        # Source-view zero crossing: first SDF sign change along the ray,
+        # depth found by linear interpolation (differentiable through the
+        # bracketing SDF values).
+        s_prev, s_next = sdfs[:, :, :-1], sdfs[:, :, 1:]
+        flip = (s_prev * s_next) < 0                           # [B,R,No-1]
+        has_flip = flip.any(dim=-1)                            # [B,R]
+        fi = flip.float().argmax(dim=-1)                       # [B,R]
+        # Single fused gather for the bracketing (dist, sdf) pairs at i and i+1.
+        ds = torch.stack((dists, sdfs), dim=-1)                # [B,R,No,2]
+        idx4 = fi[..., None, None].expand(B, R, 1, 2)
+        br0 = torch.gather(ds, 2, idx4).squeeze(2)             # [B,R,2]
+        br1 = torch.gather(ds, 2, idx4 + 1).squeeze(2)         # [B,R,2]
+        # Sanitize rays without a flip: their gathered bracket degenerates
+        # (a0 == a1 -> 0/0), and NaN/inf in the unselected torch.where
+        # branch still poisons the masked sum (NaN * 0 = NaN).
+        den_s = torch.where(has_flip, br0[..., 1] - br1[..., 1],
+                            torch.ones_like(br0[..., 1]))
+        t_star = br0[..., 0] + (br1[..., 0] - br0[..., 0]) * (br0[..., 1] / den_s)
+        t_star = torch.where(has_flip, t_star, torch.zeros_like(t_star))
+        point = center + t_star[..., None] * ray_unit          # [B,R,3]
+
+        # Ray selection: the first K rays of the batch (already randomly
+        # sampled by the dataset), optionally foreground pixels only.
+        # No data-dependent host branch here: the valid mask zeroes the
+        # excluded rows, and both zc branches are finite for all rays.
+        K = min(max_rays, R)
+        valid = has_flip
+        if mask_only and "mask_sampled" in data:
+            valid = valid & (data["mask_sampled"] > 0.5)
+        valid = valid.clone()
+        valid[:, K:] = False
+
+        # Reproject into the neighbor view (w2c convention, same as pose).
+        # All cameras are flattened to [B*R,3] matmuls (fewer eager kernels).
+        npose = data["npose"]                                  # [B,3,4]
+        nintr = data["nintr"]                                  # [B,3,3]
+        nintr_inv = data["nintr_inv"]                          # [B,3,3]
+        Rw = npose[..., :3]                                    # [B,3,3]
+        tw = npose[..., 3]                                     # [B,3]
+        Bb = Rw.shape[0]
+        pf = point.reshape(Bb, -1, 3)                          # [B,R,3]
+        p_cam = torch.baddbmm(tw[:, None, :], pf, Rw.transpose(1, 2))
+        z_ref = p_cam[..., 2]                                  # [B,R]
+        pix = torch.bmm(p_cam, nintr.transpose(1, 2))
+        z_pix = pix[..., 2].clamp_min(1e-6)
+        uv1 = torch.stack([pix[..., 0] / z_pix, pix[..., 1] / z_pix,
+                           torch.ones_like(z_ref)], dim=-1)    # [B,R,3]
+        # Un-normalized camera ray (z component == 1), so the ray parameter
+        # t equals the camera-space depth.
+        dir_cam = torch.bmm(uv1, nintr_inv.transpose(1, 2))
+        dir_world = torch.bmm(dir_cam, Rw)                     # (R^T d)^T
+        origin = -torch.bmm(tw[:, None, :], Rw).squeeze(1)     # [B,3] = -t^T R
+
+        # Windowed zero-crossing search on the neighbor ray.
+        offsets = self._consistency_offsets(device, sdfs.dtype,
+                                            num_samples, window)
+        ts = z_ref[..., None] + offsets                        # [B,R,M]
+        query = origin[:, None, None, :] + ts[..., None] * dir_world[:, :, None, :]
+        s_q = sdf_field.sdf(query).squeeze(-1)                 # [B,R,M]
+
+        q_prev, q_next = s_q[:, :, :-1], s_q[:, :, 1:]
+        q_flip = (q_prev * q_next) < 0
+        q_has = q_flip.any(dim=-1)
+        qi = q_flip.float().argmax(dim=-1)
+        idx_q = qi[..., None, None].expand(Bb, R, 1, 1)
+        qb0 = torch.gather(s_q[..., None], 2, idx_q).squeeze(2)     # [B,R,1]
+        qb1 = torch.gather(s_q[..., None], 2, idx_q + 1).squeeze(2)
+        qb0 = qb0[..., 0]
+        qb1 = qb1[..., 0]
+        step = offsets[1] - offsets[0]
+        # Same NaN guard as the source side for windowed rays without a flip.
+        den_q = torch.where(q_has, qb0 - qb1, torch.ones_like(qb0))
+        z_hat = (z_ref - window) + qi.to(sdfs.dtype) * step + step * (qb0 / den_q)
+        hit_err = (z_hat - z_ref).abs()
+
+        # No crossing inside the window: pull the closest sample toward the
+        # surface so a consistent zero-set is encouraged to form there.
+        min_abs = s_q.abs().amin(dim=-1)
+        per_ray = torch.where(q_has, hit_err, no_surface_weight * min_abs)
+
+        denom = valid.sum().clamp_min(1.0)
+        return (per_ray * valid.to(per_ray.dtype)).sum() / denom
+
+    _consistency_offsets_cache = {}
+
+    @classmethod
+    def _consistency_offsets(cls, device, dtype, num_samples, window):
+        key = (str(device), dtype, num_samples, window)
+        offsets = cls._consistency_offsets_cache.get(key)
+        if offsets is None:
+            offsets = torch.linspace(-window, window, num_samples,
+                                     device=device, dtype=dtype)
+            cls._consistency_offsets_cache[key] = offsets
+        return offsets
+
     def _compute_loss(self, data, mode=None):
         if mode == "train":
             # Compute loss only on randomly sampled rays.
@@ -236,6 +362,9 @@ class Trainer(NeuralangeloTrainer):
                 opacity_obj = data["weights"][:, :, :n_obj, 0].sum(dim=-1)  # (B,R)
                 bg = (data["mask_sampled"] < 0.5).to(opacity_obj.dtype)
                 self.losses["mask"] = (opacity_obj.pow(2) * bg).sum() / (bg.sum() + 1e-8)
+            if "consistency" in self.weights and "npose" in data:
+                # Multi-view zero-crossing depth consistency (see method).
+                self.losses["consistency"] = self._consistency_loss(data)
         else:
             # Compute loss on the entire image.
             self.losses["render"] = self.criteria["render"](data["rgb_map"], data["image"])

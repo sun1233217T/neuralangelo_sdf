@@ -25,7 +25,13 @@ import torch
 
 from importlib import import_module
 from imaginaire.config import Config
-from imaginaire.utils.gpu_affinity import set_affinity
+try:
+    from imaginaire.utils.gpu_affinity import set_affinity
+except Exception:
+    # pynvml may fail to locate nvml.dll on some Windows setups; the affinity
+    # binding is a performance nicety only — proceed without it.
+    def set_affinity(local_rank=None):
+        return None
 
 Dataset = import_module("projects.Bspline-Neus.data").Dataset
 Model = import_module("projects.Bspline-Neus.model").Model

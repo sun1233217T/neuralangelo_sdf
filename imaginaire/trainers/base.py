@@ -32,7 +32,13 @@ from imaginaire.utils.distributed import master_only_print as print
 from imaginaire.utils.distributed import is_master, get_rank
 from imaginaire.utils.set_random_seed import set_random_seed
 
-from mtools import debug
+try:
+    from mtools import debug
+except ImportError:
+    # mtools is a local utility package not available on all machines.
+    # Only ``debug`` (a breakpoint helper) is needed here.
+    import pdb
+    debug = pdb.set_trace
 
 class BaseTrainer(object):
     r"""Base trainer. We expect that all trainers inherit this class.

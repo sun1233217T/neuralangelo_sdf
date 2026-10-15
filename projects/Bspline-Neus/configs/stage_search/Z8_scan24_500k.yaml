@@ -1,0 +1,40 @@
+# Z8: DTU scan24 with the full "Z-era" geometry stack, 500k.
+# Decision experiment: W2 (current DTU baseline) reconstructs a fog/debris
+# cloud instead of the object surface (chamfer 8.5 raw units, in-box d2s
+# p50 ~106).  This run adds the stack that cleared internal fog on blender:
+# mask (background opacity zero) + consistency (multi-view zero-crossing
+# depth agreement, 0.05) + thin_shell (invisible bubble-pair penalty, 0.1)
+# + prune (3DGS-style activity pruning).  Post-run: mesh extraction +
+# chamfer decides rescue vs pivot.
+# NOTE: the original W2 stage_search config was archived to backups/; this
+# inherits from the fully-resolved saved run config instead.
+_parent_: logs/W2_wide_mark_500k/config.yaml
+
+data:
+    mask:
+        enabled: true
+    consistency:
+        enabled: true
+
+trainer:
+    loss_weight:
+        mask: 0.02
+        consistency: 0.05
+        thin_shell: 0.1
+    consistency_params:
+        num_rays: 512
+        num_samples: 33
+        window: 0.15
+        mask_only: true
+        no_surface_weight: 0.1
+    thin_shell_params:
+        delta: 0.03
+        transmittance: 0.01
+        tau: 0.005
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                prune_iters: [200000, 350000]
+                prune_margin: 3
