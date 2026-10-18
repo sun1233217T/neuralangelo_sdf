@@ -82,6 +82,32 @@ def main():
         print(f"split: {args.split}")
         print(f"samples: {len(data_all['idx'])}")
         print(f"{args.split} PSNR: {psnr:.4f}")
+        # SSIM + LPIPS from the same rendered/GT image pairs.
+        if "rgb_map" in data_all and "image" in data_all:
+            import numpy as np
+            from skimage.metrics import structural_similarity
+            rgb = data_all["rgb_map"].detach().float().clamp(0, 1).cpu().numpy()
+            gt = data_all["image"].detach().float().clamp(0, 1).cpu().numpy()
+            if rgb.ndim == 3:
+                rgb, gt = rgb[None], gt[None]
+            ssims = [structural_similarity(
+                np.moveaxis(g, 0, -1), np.moveaxis(r, 0, -1),
+                channel_axis=2, data_range=1.0) for r, g in zip(rgb, gt)]
+            ssim = float(np.mean(ssims))
+            try:
+                import lpips as _lpips
+                import torch as _torch
+                _net = _lpips.LPIPS(net="vgg").to("cuda")
+                with _torch.no_grad():
+                    lp = [_net(_torch.from_numpy(r)[None].cuda() * 2 - 1,
+                               _torch.from_numpy(g)[None].cuda() * 2 - 1).item()
+                          for r, g in zip(rgb, gt)]
+                lpips_mean = float(np.mean(lp))
+            except Exception as exc:  # noqa: BLE001
+                lpips_mean = float("nan")
+                print(f"LPIPS unavailable: {exc}")
+            print(f"{args.split} SSIM: {ssim:.4f}")
+            print(f"{args.split} LPIPS: {lpips_mean:.4f}")
 
 
 if __name__ == "__main__":

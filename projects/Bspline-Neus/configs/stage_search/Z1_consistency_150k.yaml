@@ -1,0 +1,43 @@
+# Z1: lego + mask + multi-view zero-crossing depth consistency (150k).
+# Lego is the worst internal-fog case (mask alone was -0.60 dB: alpha
+# silhouette erosion on thin parts plus an unconstrained interior).  The
+# consistency loss enforces cross-view agreement of the SDF zero crossing:
+# each foreground ray's zero crossing is reprojected into a random neighbor
+# view, whose ray must show its own crossing at the same camera depth within
+# a narrow window.  Geometry-only — windowed point SDF queries on the
+# neighbor ray, no color re-rendering.
+_parent_: projects/Bspline-Neus/configs/blender_batch/lego.yaml
+
+max_iter: 150000
+validation_iter: 50000
+
+data:
+    mask:
+        enabled: true
+    consistency:
+        enabled: true
+
+trainer:
+    cudagraph:
+        enabled: true
+    loss_weight:
+        mask: 0.02
+        consistency: 0.05
+    consistency_params:
+        num_rays: 512
+        num_samples: 33
+        window: 0.15
+        mask_only: true
+        no_surface_weight: 0.1
+
+model:
+    object:
+        bspline:
+            hierarchical:
+                refine_iters: [20000, 40000, 80000, 110000]
+                prune_iters: [115000]
+                prune_margin: 3
+
+optim:
+    sched:
+        two_steps: [100000, 130000]

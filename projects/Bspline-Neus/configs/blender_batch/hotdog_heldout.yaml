@@ -1,0 +1,9 @@
+# Auto-generated (manual): hotdog heldout evaluation config.
+_parent_: projects/Bspline-Neus/configs/blender_batch/hotdog.yaml
+
+data:
+    root: datasets/nerf_synthetic/hotdog_heldout
+    mask:
+        enabled: false
+    val:
+        subset: 25

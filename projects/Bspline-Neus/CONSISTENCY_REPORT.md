@@ -32,6 +32,20 @@
 | ficus | cons only | 26.276 → 25.589 | -0.69 | 背景杂面丛生 |
 | ficus | mask+cons | 26.276 → 25.065 | -1.21 | 几何最干净，PSNR 代价大 |
 
+### 几何补测（GT 点云，SplatSDF 发布，归一化单位对称 chamfer）
+
+| 场景 | B 基线 | Z（consistency） | 备注 |
+|------|--------|------------------|------|
+| lego | 0.0344 | 0.0419 | 场景跨度 2.29，~1.5-2% 精度 |
+| mic | 0.0375 | 0.0428 | 场景跨度 2.02 |
+| ficus | 0.0574 | 0.0597 | Z5b LCC 覆盖为 B 的 3.6 倍（195k/300k vs 54k/300k 采样存活），精度持平——更完整 |
+| ship | 0.1185 | 0.1423 | 水盆雾面拉 p90 至 0.71 |
+
+原始数据：`logs/blender_chamfer.txt`；GT：`meshout/blender_gt/`；
+脚本：`scripts/eval_blender_chamfer.py`。consistency 版 chamfer 一致略差
+（+0.008~0.03）的机制：雾被压成实体面后被 MC 提取计入统计，基线的
+雾半透明、提取面少——视觉清雾与数值 chamfer 轻微反向。
+
 - baseline = B_*_500000（mask 版批跑；ship/ficus/hotdog 的 mask 是
   本轮从 RGBA alpha 新生成的）。
 - 对比图索引：`logs/consistency_final/<scene>/{zc,render}_{ours,baseline}.png`
@@ -44,15 +58,34 @@
 
 ## 结论
 
-1. **实体/紧凑物体（lego、drums、hotdog、ship、及本就干净的
-   mic/materials/chair）**：consistency 以 ≤0.2 dB 的 PSNR 代价稳定
-   清除内部云雾，是几何质量的大幅净收益。**mask 管轮廓外、
-   consistency 管轮廓内，两者互补**——ship 无 mask 时轮廓外会滋生
-   远处杂面。
-2. **植被/亚像素结构（ficus）不适用**：叶片小于像素、跨视角严重
-   遮挡，零交叉跨视角一致的前提被系统性违反；且雾态本身就是该
-   场景的光度最优解，强行实体化必然损失 PSNR。这是清晰的适用
-   边界，建议作为 limitation 报告或在植被类场景降权/关闭。
+### Heldout 主表（25 张真新视角，PSNR/SSIM/LPIPS，协议净化后）
+
+| 场景 | B 基线 | Z（consistency） | ΔPSNR |
+|------|--------|------------------|-------|
+| lego | 25.90 / 0.904 / 0.109 | 25.85 / 0.902 / 0.109 | -0.05 |
+| mic | 29.64 / 0.957 / 0.057 | 29.58 / 0.955 / 0.058 | -0.06 |
+| hotdog | 31.13 / 0.962 / 0.066 | 31.30 / 0.962 / 0.067 | **+0.17** |
+| ship | 23.40 / 0.770 / 0.262 | 22.89 / 0.759 / 0.268 | -0.51 |
+| drums | 16.93 / 0.758 / 0.237 | **18.49 / 0.805 / 0.193** | **+1.56** |
+| ficus | 17.47 / 0.786 / 0.201 | **18.86 / 0.822 / 0.156** | **+1.39** |
+
+（原始记录：`logs/heldout_metrics.txt`。chair 21.25 / materials 25.15 仅基线。）
+
+**train-view 与 heldout 结论系统性不一致——consistency 的真实价值在泛化**：
+drums/ficus 在 train-view 上是 -0.17/-1.21 的"负收益"，heldout 上翻转为
++1.56/+1.39。机制：consistency 压掉的云雾是训练视角的过拟合自由度，
+对未见视角本来就是负担；几何一致性换来的是泛化。ship 是唯一 heldout
+负收益场景（无 mask，背景杂面代价）。
+
+1. **实体/紧凑物体（lego、drums、hotdog、mic）**：consistency 在
+   heldout 下持平到 +1.6 dB，云雾清除，几何 chamfer 略差于基线
+   （+0.008~0.03，见几何补测）——视觉清雾与 MC 数值轻微反向。
+2. **植被/亚像素结构（ficus）**：train-view PSNR 代价 -1.21，但
+   heldout **+1.39** 且 LCC 覆盖 3.6 倍——"失败"在泛化视角下
+   重新定义：它压掉的正是对训练视角过拟合的半透明叶雾。措辞应改为
+   "对过拟合雾态的重构"，并强调这是单一数据集的 anecdote。
+3. **consistency 适用边界**：mask 管轮廓外、consistency 管轮廓内；
+   无 mask 时远处杂面（ship）会滋生。
 
 ## 工程备注
 

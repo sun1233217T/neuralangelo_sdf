@@ -1,0 +1,15 @@
+# Auto-generated (manual): blender hotdog 500k, mask-supervised.
+# hotdog was missing from blender_batch/ (its B_* run lived only on the
+# server); created for heldout evaluation parity with the other scenes.
+_parent_: projects/Bspline-Neus/configs/stage_search/Y14_lego_500k.yaml
+
+data:
+    root: datasets/nerf_synthetic/hotdog
+    mask:
+        enabled: true
+    train:
+        batch_size: 1
+
+trainer:
+    loss_weight:
+        mask: 0.02
